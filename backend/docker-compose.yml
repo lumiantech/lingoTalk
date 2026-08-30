@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: lumian-lingo-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: lumian_lingo
+      POSTGRES_USER: lumian
+      POSTGRES_PASSWORD: lumian_dev
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - lumian_lingo_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  lumian_lingo_postgres_data:
