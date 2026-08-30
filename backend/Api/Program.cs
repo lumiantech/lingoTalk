@@ -1,4 +1,5 @@
 using Api.Auth;
+using Api.Hubs;
 using Api.Middleware;
 using Api.Services;
 using Core.Interfaces;
@@ -47,8 +48,23 @@ builder.Services.AddScoped<IClaimsTransformation, UserClaimsTransformation>();
 
 builder.Services.AddAuthorization();
 
+builder.Services.AddSignalR();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("MobileApp", policy =>
+    {
+        policy
+            .WithOrigins("http://localhost:8100")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
+    });
+});
+
 var app = builder.Build();
 
+app.UseCors("MobileApp");
 
 
 var firebaseInitializer =
@@ -72,5 +88,6 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+app.MapHub<TranslationHub>("/hubs/translation");
 
 app.Run();
