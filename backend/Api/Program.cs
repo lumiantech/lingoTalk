@@ -55,7 +55,9 @@ builder.Services.AddCors(options =>
     options.AddPolicy("MobileApp", policy =>
     {
         policy
-            .WithOrigins("http://localhost:8100")
+            .WithOrigins(
+                "http://localhost:8100",
+                "http://localhost")
             .AllowAnyHeader()
             .AllowAnyMethod()
             .AllowCredentials();

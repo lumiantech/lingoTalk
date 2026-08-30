@@ -33,7 +33,10 @@
                 "output": "assets"
               }
             ],
-            "styles": ["src/global.scss", "src/theme/variables.scss"],
+            "styles": [
+              "src/global.scss",
+              "src/theme/variables.scss"
+            ],
             "scripts": [],
             "browser": "src/main.ts"
           },
@@ -97,7 +100,9 @@
           "options": {
             "tsConfig": "tsconfig.spec.json",
             "buildTarget": "::development",
-            "setupFiles": ["src/test-setup.ts"]
+            "setupFiles": [
+              "src/test-setup.ts"
+            ]
           },
           "configurations": {
             "ci": {
@@ -108,23 +113,38 @@
         "lint": {
           "builder": "@angular-eslint/builder:lint",
           "options": {
-            "lintFilePatterns": ["src/**/*.ts", "src/**/*.html"]
+            "lintFilePatterns": [
+              "src/**/*.ts",
+              "src/**/*.html"
+            ]
           }
         }
       }
     }
   },
   "cli": {
-    "schematicCollections": ["@ionic/angular-toolkit"]
+    "schematicCollections": [
+      "@ionic/angular-toolkit"
+    ]
   },
   "schematics": {
     "@ionic/angular-toolkit:component": {
       "styleext": "scss",
       "standalone": true
     },
-    "@ionic/angular-toolkit:page": {
-      "styleext": "scss",
-      "standalone": true
+    "schematics": {
+      "@ionic/angular-toolkit:page": {
+        "styleext": "scss",
+        "standalone": true
+      },
+      "@schematics/angular:component": {
+        "type": "component",
+         "add-type-to-class-name": true
+      },
+      "@schematics/angular:service": {
+        "type": "service",
+         "add-type-to-class-name": true
+      }
     },
     "@angular-eslint/schematics:application": {
       "setParserOptionsProject": true

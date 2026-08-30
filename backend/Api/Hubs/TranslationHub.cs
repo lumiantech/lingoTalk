@@ -17,4 +17,15 @@ public sealed class TranslationHub : Hub
             Context.ConnectionId,
             sessionId);
     }
+
+    public async Task SendText(
+        string sessionId,
+        string text)
+    {
+        await Clients
+            .OthersInGroup(sessionId)
+            .SendAsync(
+                "TextReceived",
+                text);
+    }
 }

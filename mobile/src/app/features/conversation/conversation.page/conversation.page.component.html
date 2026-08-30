@@ -1,0 +1,58 @@
+<ion-header>
+  <ion-toolbar>
+    <ion-title>Lumian Lingo Talk</ion-title>
+  </ion-toolbar>
+</ion-header>
+
+<ion-content class="ion-padding">
+
+  <ion-item>
+    <ion-input
+      label="Session"
+      labelPlacement="stacked"
+      placeholder="Session ID"
+      [(ngModel)]="sessionId">
+    </ion-input>
+  </ion-item>
+
+  <ion-button
+    expand="block"
+    [disabled]="joined"
+    (click)="joinSession()">
+    {{ joined ? 'Connected' : 'Join conversation' }}
+  </ion-button>
+
+  <ion-list>
+    @for (message of messages; track $index) {
+      <ion-item>
+        <ion-label>
+          <strong>
+            {{ message.direction === 'sent' ? 'You' : 'Other' }}
+          </strong>
+
+          <div>
+            {{ message.text }}
+          </div>
+        </ion-label>
+      </ion-item>
+    }
+  </ion-list>
+
+  <ion-item>
+    <ion-input
+      label="Message"
+      labelPlacement="stacked"
+      placeholder="Write a message..."
+      [(ngModel)]="messageText"
+      (keyup.enter)="send()">
+    </ion-input>
+  </ion-item>
+
+  <ion-button
+    expand="block"
+    [disabled]="!joined || !messageText.trim()"
+    (click)="send()">
+    Send
+  </ion-button>
+
+</ion-content>
