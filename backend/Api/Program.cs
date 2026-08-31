@@ -56,7 +56,11 @@ builder.Services.AddCors(options =>
         policy
             .WithOrigins(
                 "http://localhost:8100",
-                "http://localhost")
+                 "https://localhost:8100",
+                "http://localhost",
+                "https://localhost",
+                "http://192.168.100.12:8100",
+                "https://192.168.100.12:8100")
             .AllowAnyHeader()
             .AllowAnyMethod()
             .AllowCredentials();
@@ -89,7 +93,7 @@ if (app.Environment.IsDevelopment())
     Console.WriteLine("5. Database initialized");
 }
 
-app.UseHttpsRedirection();
+// app.UseHttpsRedirection();
 
 app.UseAuthentication();
 app.UseAuthorization();

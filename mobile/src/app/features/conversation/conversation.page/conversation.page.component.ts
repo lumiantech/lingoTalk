@@ -1,5 +1,5 @@
 import { CommonModule } from '@angular/common';
-import { Component, inject, OnDestroy, signal } from '@angular/core';
+import { Component, effect, ElementRef, inject, OnDestroy, signal, ViewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import {
   IonButton,
@@ -14,6 +14,7 @@ import {
 } from '@ionic/angular';
 import { TranslationSignalRService } from '../../../core/services/translation-signal-r';
 import { environment } from '../../../../environments/environment';
+import { WebRtcService } from '../../../core/services/web-rtc.service';
 
 
 
@@ -43,7 +44,59 @@ interface ConversationMessage {
   ]
 })
 export class ConversationPageComponent implements OnDestroy {
+  @ViewChild('localVideo')
+  private localVideo?: ElementRef<HTMLVideoElement>;
+
+  @ViewChild('remoteVideo')
+  private remoteVideo?: ElementRef<HTMLVideoElement>;
+
+  constructor() {
+
+    effect(() => {
+
+      const stream =
+        this.webRtc.localMediaStream();
+
+      if (
+        stream &&
+        this.localVideo
+      ) {
+        this.localVideo.nativeElement
+          .srcObject = stream;
+      }
+    });
+
+    effect(() => {
+
+      const stream = this.webRtc.remoteMediaStream();
+
+      if (stream && this.remoteVideo) {
+        this.remoteVideo.nativeElement
+          .srcObject = stream;
+      }
+    });
+  }
+
+
+  private async ensureWebRtc(): Promise<void> {
+
+    await this.webRtc.createPeerConnection(
+      async candidate => {
+
+        await this.signalR
+          .sendIceCandidate(
+            this.sessionId.trim(),
+            candidate
+          );
+      }
+    );
+
+    this.bindVideoStreams();
+  }
   private readonly signalR = inject(TranslationSignalRService);
+
+  readonly webRtc = inject(WebRtcService);
+
   sessionId = '';
   messageText = '';
 
@@ -52,20 +105,76 @@ export class ConversationPageComponent implements OnDestroy {
 
   messages = signal<ConversationMessage[]>([]);
 
-  async connect(): Promise<void> {
-    await this.signalR.connect(environment.apiBaseUrl);
 
-    this.signalR.onTextReceived((text: string) => {
-      this.messages.update(messages => [
-        ...messages,
-        {
-          text,
-          direction: 'received'
-        }
-      ]);
-    });
+
+  async connect(): Promise<void> {
+
+    await this.signalR.connect(
+      environment.apiBaseUrl
+    );
+
+    this.signalR.onTextReceived(
+      (text: string) => {
+
+        this.messages.update(
+          messages => [
+            ...messages,
+            {
+              text,
+              direction: 'received'
+            }
+          ]
+        );
+      }
+    );
+
+    this.registerWebRtcSignaling();
 
     this.connected.set(true);
+  }
+
+  private registerWebRtcSignaling(): void {
+
+    this.signalR.onWebRtcOffer(
+      async offer => {
+
+        await this.ensureWebRtc();
+
+        const answer =
+          await this.webRtc.acceptOffer(
+            offer
+          );
+
+        await this.signalR
+          .sendWebRtcAnswer(
+            this.sessionId.trim(),
+            answer
+          );
+
+        this.bindVideoStreams();
+      }
+    );
+
+    this.signalR.onWebRtcAnswer(
+      async answer => {
+
+        await this.webRtc.acceptAnswer(
+          answer
+        );
+
+        this.bindVideoStreams();
+      }
+    );
+
+    this.signalR.onIceCandidate(
+      async candidate => {
+
+        await this.webRtc
+          .addIceCandidate(
+            candidate
+          );
+      }
+    );
   }
 
   async joinSession(): Promise<void> {
@@ -115,5 +224,49 @@ export class ConversationPageComponent implements OnDestroy {
     }
 
     await this.signalR.disconnect();
+  }
+
+  async startCall(): Promise<void> {
+
+    if (!this.joined()) {
+      return;
+    }
+
+    await this.webRtc.createPeerConnection(
+      async candidate => {
+        await this.signalR.sendIceCandidate(
+          this.sessionId.trim(),
+          candidate
+        );
+      },
+      true
+    );
+
+    const offer =
+      await this.webRtc.createOffer();
+
+    await this.signalR.sendWebRtcOffer(
+      this.sessionId.trim(),
+      offer
+    );
+  }
+
+  async endCall(): Promise<void> {
+    await this.webRtc.endCall();
+  }
+
+  private bindVideoStreams(): void {
+
+    const local = this.webRtc.localMediaStream();
+
+    const remote = this.webRtc.remoteMediaStream();
+
+    if (local && this.localVideo) {
+      this.localVideo.nativeElement.srcObject = local;
+    }
+
+    if (remote && this.remoteVideo) {
+      this.remoteVideo.nativeElement.srcObject = remote;
+    }
   }
 }

@@ -1,3 +1,55 @@
 :host {
   display: block;
 }
+
+.video-container {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #111;
+  overflow: hidden;
+  border-radius: 12px;
+}
+
+.remote-video-container {
+  width: 100%;
+  height: 100%;
+}
+
+.remote-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.local-video {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+
+  width: 28%;
+  max-width: 180px;
+
+  aspect-ratio: 9 / 16;
+
+  object-fit: cover;
+
+  border-radius: 10px;
+}
+
+.video-placeholder {
+  position: absolute;
+  inset: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  color: white;
+}
+
+.call-controls {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
