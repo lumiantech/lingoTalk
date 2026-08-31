@@ -29,7 +29,6 @@ builder.Services.AddInfrastructure(
     builder.Configuration);
 
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
 
 builder.Services
     .AddAuthentication(options =>
@@ -66,22 +65,28 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+Console.WriteLine("1. App built");
+
 app.UseCors("MobileApp");
 
+Console.WriteLine("2. Starting Firebase");
 
 var firebaseInitializer =
     app.Services.GetRequiredService<FirebaseInitializer>();
 
 firebaseInitializer.Initialize();
 
+Console.WriteLine("3. Firebase initialized");
+
 app.UseMiddleware<ExceptionMiddleware>();
 
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    Console.WriteLine("4. Starting database initialization");
 
     await app.Services.InitializeDatabaseAsync();
+
+    Console.WriteLine("5. Database initialized");
 }
 
 app.UseHttpsRedirection();
@@ -91,5 +96,7 @@ app.UseAuthorization();
 
 app.MapControllers();
 app.MapHub<TranslationHub>("/hubs/translation");
+
+Console.WriteLine("6. Starting web server");
 
 app.Run();

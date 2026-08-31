@@ -17,13 +17,13 @@
 
   <ion-button
     expand="block"
-    [disabled]="joined"
+    [disabled]="joined()"
     (click)="joinSession()">
-    {{ joined ? 'Connected' : 'Join conversation' }}
+    {{ joined() ? 'Connected' : 'Join conversation' }}
   </ion-button>
 
   <ion-list>
-    @for (message of messages; track $index) {
+    @for (message of messages(); track $index) {
       <ion-item>
         <ion-label>
           <strong>
@@ -50,7 +50,7 @@
 
   <ion-button
     expand="block"
-    [disabled]="!joined || !messageText.trim()"
+    [disabled]="!joined() || !messageText.trim()"
     (click)="send()">
     Send
   </ion-button>

@@ -1,5 +1,5 @@
 import { CommonModule } from '@angular/common';
-import { Component, inject, OnDestroy } from '@angular/core';
+import { Component, inject, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import {
   IonButton,
@@ -43,26 +43,29 @@ interface ConversationMessage {
   ]
 })
 export class ConversationPageComponent implements OnDestroy {
-private readonly signalR = inject(TranslationSignalRService);
+  private readonly signalR = inject(TranslationSignalRService);
   sessionId = '';
   messageText = '';
 
-  connected = false;
-  joined = false;
+  connected = signal(false);
+  joined = signal(false);
 
-  messages: ConversationMessage[] = [];
+  messages = signal<ConversationMessage[]>([]);
 
   async connect(): Promise<void> {
     await this.signalR.connect(environment.apiBaseUrl);
 
     this.signalR.onTextReceived((text: string) => {
-      this.messages.push({
-        text,
-        direction: 'received'
-      });
+      this.messages.update(messages => [
+        ...messages,
+        {
+          text,
+          direction: 'received'
+        }
+      ]);
     });
 
-    this.connected = true;
+    this.connected.set(true);
   }
 
   async joinSession(): Promise<void> {
@@ -72,19 +75,19 @@ private readonly signalR = inject(TranslationSignalRService);
       return;
     }
 
-    if (!this.connected) {
+    if (!this.connected()) {
       await this.connect();
     }
 
     await this.signalR.joinSession(sessionId);
 
-    this.joined = true;
+    this.joined.set(true);
   }
 
   async send(): Promise<void> {
     const text = this.messageText.trim();
 
-    if (!text || !this.joined) {
+    if (!text || !this.joined()) {
       return;
     }
 
@@ -93,16 +96,19 @@ private readonly signalR = inject(TranslationSignalRService);
       text
     );
 
-    this.messages.push({
-      text,
-      direction: 'sent'
-    });
+    this.messages.update(messages => [
+      ...messages,
+      {
+        text,
+        direction: 'sent'
+      }
+    ]);
 
     this.messageText = '';
   }
 
   async ngOnDestroy(): Promise<void> {
-    if (this.joined) {
+    if (this.joined()) {
       await this.signalR.leaveSession(
         this.sessionId.trim()
       );
