@@ -1,4 +1,5 @@
 using Api.Auth;
+using Api.Hubs;
 using Api.Middleware;
 using Api.Services;
 using Core.Interfaces;
@@ -28,7 +29,6 @@ builder.Services.AddInfrastructure(
     builder.Configuration);
 
 builder.Services.AddEndpointsApiExplorer();
-builder.Services.AddSwaggerGen();
 
 builder.Services
     .AddAuthentication(options =>
@@ -47,30 +47,60 @@ builder.Services.AddScoped<IClaimsTransformation, UserClaimsTransformation>();
 
 builder.Services.AddAuthorization();
 
+builder.Services.AddSignalR();
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("MobileApp", policy =>
+    {
+        policy
+            .WithOrigins(
+                "http://localhost:8100",
+                 "https://localhost:8100",
+                "http://localhost",
+                "https://localhost",
+                "http://192.168.100.12:8100",
+                "https://192.168.100.12:8100")
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials();
+    });
+});
+
 var app = builder.Build();
 
+Console.WriteLine("1. App built");
 
+app.UseCors("MobileApp");
+
+Console.WriteLine("2. Starting Firebase");
 
 var firebaseInitializer =
     app.Services.GetRequiredService<FirebaseInitializer>();
 
 firebaseInitializer.Initialize();
 
+Console.WriteLine("3. Firebase initialized");
+
 app.UseMiddleware<ExceptionMiddleware>();
 
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
+    Console.WriteLine("4. Starting database initialization");
 
     await app.Services.InitializeDatabaseAsync();
+
+    Console.WriteLine("5. Database initialized");
 }
 
-app.UseHttpsRedirection();
+// app.UseHttpsRedirection();
 
 app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+app.MapHub<TranslationHub>("/hubs/translation");
+
+Console.WriteLine("6. Starting web server");
 
 app.Run();

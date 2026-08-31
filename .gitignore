@@ -485,3 +485,10 @@ $RECYCLE.BIN/
 API/appsettings.json
 
 android/app/src/main/assets/models/mask2former.onnx
+
+firebase-service-account.json
+**/firebase-service-account.json
+
+*.p12
+*.pfx
+*.pem
