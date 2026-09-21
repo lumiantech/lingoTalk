@@ -31,6 +31,11 @@
                 "glob": "**/*",
                 "input": "src/assets",
                 "output": "assets"
+              },
+              {
+                "glob": "**/*",
+                "input": "public",
+                "output": "/"
               }
             ],
             "styles": [
@@ -139,11 +144,11 @@
       },
       "@schematics/angular:component": {
         "type": "component",
-         "add-type-to-class-name": true
+        "add-type-to-class-name": true
       },
       "@schematics/angular:service": {
         "type": "service",
-         "add-type-to-class-name": true
+        "add-type-to-class-name": true
       }
     },
     "@angular-eslint/schematics:application": {

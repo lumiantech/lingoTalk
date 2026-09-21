@@ -5,6 +5,11 @@ const config: CapacitorConfig = {
   appName: 'mobile',
   webDir: 'www',
 
+  server: {
+     androidScheme: 'http',
+    cleartext: true
+  },
+
   android: {
     allowMixedContent: true
   }

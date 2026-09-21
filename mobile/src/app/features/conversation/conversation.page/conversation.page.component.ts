@@ -15,6 +15,7 @@ import {
 import { TranslationSignalRService } from '../../../core/services/translation-signal-r';
 import { environment } from '../../../../environments/environment';
 import { WebRtcService } from '../../../core/services/web-rtc.service';
+import { SpeechRecognitionService } from '../../../core/services/speech-recognition.service';
 
 
 
@@ -54,25 +55,32 @@ export class ConversationPageComponent implements OnDestroy {
 
     effect(() => {
 
-      const stream =
-        this.webRtc.localMediaStream();
+      const callConnected =
+        this.webRtc.callConnected();
 
-      if (
-        stream &&
-        this.localVideo
-      ) {
-        this.localVideo.nativeElement
-          .srcObject = stream;
-      }
-    });
+      console.log(
+        '★★★★★ CALL CONNECTED:',
+        callConnected,
+        '★★★★★'
+      );
 
-    effect(() => {
+      if (callConnected) {
 
-      const stream = this.webRtc.remoteMediaStream();
+        console.log(
+          '★★★★★ STARTING STT hr-HR ★★★★★'
+        );
 
-      if (stream && this.remoteVideo) {
-        this.remoteVideo.nativeElement
-          .srcObject = stream;
+        void this.speech.start(
+          'hr-HR'
+        );
+
+      } else {
+
+        console.log(
+          '★★★★★ STOPPING STT ★★★★★'
+        );
+
+        void this.speech.stop();
       }
     });
   }
@@ -96,6 +104,7 @@ export class ConversationPageComponent implements OnDestroy {
   private readonly signalR = inject(TranslationSignalRService);
 
   readonly webRtc = inject(WebRtcService);
+  readonly speech = inject(SpeechRecognitionService);
 
   sessionId = '';
   messageText = '';
@@ -138,12 +147,22 @@ export class ConversationPageComponent implements OnDestroy {
     this.signalR.onWebRtcOffer(
       async offer => {
 
+        console.log(
+          'WEBRTC OFFER RECEIVED',
+          offer
+        );
+
         await this.ensureWebRtc();
 
         const answer =
           await this.webRtc.acceptOffer(
             offer
           );
+
+        console.log(
+          'WEBRTC ANSWER CREATED',
+          answer
+        );
 
         await this.signalR
           .sendWebRtcAnswer(

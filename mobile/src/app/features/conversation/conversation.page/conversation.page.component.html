@@ -51,6 +51,29 @@
     Call state:
     {{ webRtc.callState() }}
   </div>
+  <div>
+    STT state:
+    {{ speech.state() }}
+  </div>
+
+  <div>
+    Partial:
+    {{ speech.partialText() }}
+  </div>
+
+  <div>
+    Final:
+    {{ speech.finalText() }}
+  </div>
+
+  @if (speech.error()) {
+
+  <div>
+    STT error:
+    {{ speech.error() }}
+  </div>
+
+  }
 
   <ion-list>
     @for (message of messages(); track $index) {
