@@ -1,10 +1,19 @@
-import { Injectable, Service } from '@angular/core';
+import { Injectable } from '@angular/core';
 import {
   HubConnection,
   HubConnectionBuilder,
   HubConnectionState,
   LogLevel
 } from '@microsoft/signalr';
+
+export interface SubtitleMessage {
+  segmentId: string;
+  originalText: string;
+  translatedText: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  isFinal: boolean;
+}
 
 @Injectable({
   providedIn: 'root'
@@ -14,32 +23,62 @@ export class TranslationSignalRService {
   private hubConnection?: HubConnection;
 
   async connect(baseUrl: string): Promise<void> {
+
     if (
-      this.hubConnection?.state === HubConnectionState.Connected ||
-      this.hubConnection?.state === HubConnectionState.Connecting
+      this.hubConnection?.state ===
+      HubConnectionState.Connected ||
+      this.hubConnection?.state ===
+      HubConnectionState.Connecting
     ) {
       return;
     }
 
-    this.hubConnection = new HubConnectionBuilder()
-      .withUrl(`${baseUrl}/hubs/translation`)
-      .withAutomaticReconnect()
-      .configureLogging(LogLevel.Information)
-      .build();
+    this.hubConnection =
+      new HubConnectionBuilder()
+        .withUrl(
+          `${baseUrl}/hubs/translation`
+        )
+        .withAutomaticReconnect()
+        .configureLogging(
+          LogLevel.Information
+        )
+        .build();
 
     await this.hubConnection.start();
   }
 
-  async joinSession(sessionId: string): Promise<void> {
+  async joinSession(
+    sessionId: string,
+    language: string
+  ): Promise<void> {
+
     this.ensureConnected();
 
     await this.hubConnection!.invoke(
       'JoinSession',
-      sessionId
+      sessionId,
+      language
     );
   }
 
-  async leaveSession(sessionId: string): Promise<void> {
+  async updateLanguage(
+    sessionId: string,
+    language: string
+  ): Promise<void> {
+
+    this.ensureConnected();
+
+    await this.hubConnection!.invoke(
+      'UpdateLanguage',
+      sessionId,
+      language
+    );
+  }
+
+  async leaveSession(
+    sessionId: string
+  ): Promise<void> {
+
     if (
       this.hubConnection?.state !==
       HubConnectionState.Connected
@@ -53,10 +92,69 @@ export class TranslationSignalRService {
     );
   }
 
+  onParticipantLanguageChanged(
+    handler: (language: string) => void
+  ): void {
+
+    this.hubConnection?.off(
+      'ParticipantLanguageChanged'
+    );
+
+    this.hubConnection?.on(
+      'ParticipantLanguageChanged',
+      handler
+    );
+  }
+
+  onParticipantLeft(
+    handler: () => void
+  ): void {
+
+    this.hubConnection?.off(
+      'ParticipantLeft'
+    );
+
+    this.hubConnection?.on(
+      'ParticipantLeft',
+      handler
+    );
+  }
+
+  async sendSubtitle(
+    sessionId: string,
+    subtitle: SubtitleMessage
+  ): Promise<void> {
+
+    this.ensureConnected();
+
+    await this.hubConnection!.invoke(
+      'SendSubtitle',
+      sessionId,
+      subtitle
+    );
+  }
+
+  onSubtitleReceived(
+    handler: (
+      subtitle: SubtitleMessage
+    ) => void
+  ): void {
+
+    this.hubConnection?.off(
+      'SubtitleReceived'
+    );
+
+    this.hubConnection?.on(
+      'SubtitleReceived',
+      handler
+    );
+  }
+
   async sendText(
     sessionId: string,
     text: string
   ): Promise<void> {
+
     this.ensureConnected();
 
     await this.hubConnection!.invoke(
@@ -69,7 +167,10 @@ export class TranslationSignalRService {
   onTextReceived(
     handler: (text: string) => void
   ): void {
-    this.hubConnection?.off('TextReceived');
+
+    this.hubConnection?.off(
+      'TextReceived'
+    );
 
     this.hubConnection?.on(
       'TextReceived',
@@ -77,14 +178,15 @@ export class TranslationSignalRService {
     );
   }
 
-  // -------------------------
-  // WebRTC signaling
-  // -------------------------
+  // -----------------------------------------
+  // WebRTC
+  // -----------------------------------------
 
   async sendWebRtcOffer(
     sessionId: string,
     offer: RTCSessionDescriptionInit
   ): Promise<void> {
+
     this.ensureConnected();
 
     await this.hubConnection!.invoke(
@@ -98,6 +200,7 @@ export class TranslationSignalRService {
     sessionId: string,
     answer: RTCSessionDescriptionInit
   ): Promise<void> {
+
     this.ensureConnected();
 
     await this.hubConnection!.invoke(
@@ -111,6 +214,7 @@ export class TranslationSignalRService {
     sessionId: string,
     candidate: RTCIceCandidateInit
   ): Promise<void> {
+
     this.ensureConnected();
 
     await this.hubConnection!.invoke(
@@ -125,6 +229,7 @@ export class TranslationSignalRService {
       offer: RTCSessionDescriptionInit
     ) => void
   ): void {
+
     this.hubConnection?.off(
       'WebRtcOfferReceived'
     );
@@ -132,7 +237,10 @@ export class TranslationSignalRService {
     this.hubConnection?.on(
       'WebRtcOfferReceived',
       (json: string) => {
-        handler(JSON.parse(json));
+
+        handler(
+          JSON.parse(json)
+        );
       }
     );
   }
@@ -142,6 +250,7 @@ export class TranslationSignalRService {
       answer: RTCSessionDescriptionInit
     ) => void
   ): void {
+
     this.hubConnection?.off(
       'WebRtcAnswerReceived'
     );
@@ -149,7 +258,10 @@ export class TranslationSignalRService {
     this.hubConnection?.on(
       'WebRtcAnswerReceived',
       (json: string) => {
-        handler(JSON.parse(json));
+
+        handler(
+          JSON.parse(json)
+        );
       }
     );
   }
@@ -159,6 +271,7 @@ export class TranslationSignalRService {
       candidate: RTCIceCandidateInit
     ) => void
   ): void {
+
     this.hubConnection?.off(
       'IceCandidateReceived'
     );
@@ -166,12 +279,16 @@ export class TranslationSignalRService {
     this.hubConnection?.on(
       'IceCandidateReceived',
       (json: string) => {
-        handler(JSON.parse(json));
+
+        handler(
+          JSON.parse(json)
+        );
       }
     );
   }
 
   async disconnect(): Promise<void> {
+
     if (!this.hubConnection) {
       return;
     }
@@ -182,11 +299,13 @@ export class TranslationSignalRService {
   }
 
   private ensureConnected(): void {
+
     if (
       !this.hubConnection ||
       this.hubConnection.state !==
-        HubConnectionState.Connected
+      HubConnectionState.Connected
     ) {
+
       throw new Error(
         'SignalR is not connected.'
       );

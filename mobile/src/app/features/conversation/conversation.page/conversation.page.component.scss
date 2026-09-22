@@ -53,3 +53,59 @@
   gap: 8px;
   margin-top: 12px;
 }
+
+.remote-video-container {
+  position: relative;
+}
+
+.subtitle-overlay {
+  position: absolute;
+
+  left: 5%;
+  right: 5%;
+  bottom: 7%;
+
+  z-index: 20;
+
+  text-align: center;
+
+  pointer-events: none;
+}
+
+.subtitle-original,
+.subtitle-translation {
+  display: table;
+
+  max-width: 100%;
+
+  margin-left: auto;
+  margin-right: auto;
+
+  padding: 4px 10px;
+
+  background: rgba(0, 0, 0, 0.72);
+
+  color: white;
+
+  font-size: 18px;
+  line-height: 1.3;
+
+  text-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.9);
+}
+
+.subtitle-original {
+  margin-bottom: 3px;
+}
+
+.subtitle-translation {
+  font-weight: 600;
+}
+
+.language-status {
+  margin: 8px 0 12px;
+
+  text-align: center;
+
+  font-size: 13px;
+}

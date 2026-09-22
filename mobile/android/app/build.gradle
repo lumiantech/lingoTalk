@@ -43,6 +43,7 @@ dependencies {
     implementation project(':capacitor-cordova-android-plugins')
     implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8'
     implementation 'org.apache.commons:commons-compress:1.28.0'
+    implementation 'com.google.mlkit:translate:17.0.3'
 }
 
 apply from: 'capacitor.build.gradle'

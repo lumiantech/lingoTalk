@@ -18,6 +18,8 @@ class MainActivity : BridgeActivity() {
 
         registerPlugin(SpeechRecognitionPlugin::class.java)
 
+        registerPlugin(OfflineTranslationPlugin::class.java)
+
         super.onCreate(savedInstanceState)
 
         bridge.webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
