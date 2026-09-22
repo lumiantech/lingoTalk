@@ -1,4 +1,4 @@
-import { Service } from '@angular/core';
+import { Injectable, Service } from '@angular/core';
 import {
   HubConnection,
   HubConnectionBuilder,
@@ -6,7 +6,9 @@ import {
   LogLevel
 } from '@microsoft/signalr';
 
-@Service()
+@Injectable({
+  providedIn: 'root'
+})
 export class TranslationSignalRService {
 
   private hubConnection?: HubConnection;

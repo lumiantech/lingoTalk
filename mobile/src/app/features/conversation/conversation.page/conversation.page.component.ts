@@ -9,12 +9,16 @@ import {
   IonItem,
   IonLabel,
   IonList,
+  IonSelect,
+  IonSelectOption,
   IonTitle,
   IonToolbar
 } from '@ionic/angular';
 import { TranslationSignalRService } from '../../../core/services/translation-signal-r';
 import { environment } from '../../../../environments/environment';
 import { WebRtcService } from '../../../core/services/web-rtc.service';
+import { SpeechRecognitionService } from '../../../core/services/speech-recognition.service';
+
 
 
 
@@ -40,7 +44,9 @@ interface ConversationMessage {
     IonLabel,
     IonInput,
     IonButton,
-    IonList
+    IonList,
+    IonSelect,
+    IonSelectOption
   ]
 })
 export class ConversationPageComponent implements OnDestroy {
@@ -54,25 +60,30 @@ export class ConversationPageComponent implements OnDestroy {
 
     effect(() => {
 
-      const stream =
-        this.webRtc.localMediaStream();
+      const callConnected =
+        this.webRtc.callConnected();
 
-      if (
-        stream &&
-        this.localVideo
-      ) {
-        this.localVideo.nativeElement
-          .srcObject = stream;
-      }
-    });
+      console.log(
+        '★★★★★ CALL CONNECTED:',
+        callConnected,
+        '★★★★★'
+      );
 
-    effect(() => {
+      if (callConnected) {
 
-      const stream = this.webRtc.remoteMediaStream();
+        console.log(
+          '★★★★★ STARTING STT', this.selectedLanguage, '★★★★★'
+        );
 
-      if (stream && this.remoteVideo) {
-        this.remoteVideo.nativeElement
-          .srcObject = stream;
+        void this.speech.start(this.selectedLanguage);
+
+      } else {
+
+        console.log(
+          '★★★★★ STOPPING STT ★★★★★'
+        );
+
+        void this.speech.stop();
       }
     });
   }
@@ -96,9 +107,31 @@ export class ConversationPageComponent implements OnDestroy {
   private readonly signalR = inject(TranslationSignalRService);
 
   readonly webRtc = inject(WebRtcService);
+  readonly speech = inject(SpeechRecognitionService);
 
+  readonly languages = [
+    { code: 'auto', name: 'Auto detect' },
+    { code: 'en-US', name: 'English' },
+    { code: 'de-DE', name: 'Deutsch' },
+    { code: 'es-ES', name: 'Español' },
+    { code: 'fr-FR', name: 'Français' },
+    { code: 'it-IT', name: 'Italiano' },
+    { code: 'pt-PT', name: 'Português' },
+    { code: 'ar-AR', name: 'العربية' },
+    { code: 'ru-RU', name: 'Русский' },
+    { code: 'hr-HR', name: 'Hrvatski' }
+  ];
+
+  selectedLanguage = localStorage.getItem('lingo-language') ?? 'hr-HR';
   sessionId = '';
   messageText = '';
+
+  async languageChanged(): Promise<void> {
+    localStorage.setItem('lingo-language', this.selectedLanguage);
+    if (this.webRtc.callConnected()) {
+      await this.speech.restart(this.selectedLanguage);
+    }
+  }
 
   connected = signal(false);
   joined = signal(false);
@@ -138,12 +171,22 @@ export class ConversationPageComponent implements OnDestroy {
     this.signalR.onWebRtcOffer(
       async offer => {
 
+        console.log(
+          'WEBRTC OFFER RECEIVED',
+          offer
+        );
+
         await this.ensureWebRtc();
 
         const answer =
           await this.webRtc.acceptOffer(
             offer
           );
+
+        console.log(
+          'WEBRTC ANSWER CREATED',
+          answer
+        );
 
         await this.signalR
           .sendWebRtcAnswer(
