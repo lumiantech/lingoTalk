@@ -697,8 +697,66 @@ peerConnection.onconnectionstatechange =
         worklet.port.onmessage =
             event => {
 
+                const data =
+                    event.data;
+
+
+                // RAW 48 kHz diagnostic message.
+                // Never forward diagnostic objects to native STT.
+                if (
+                    data &&
+                    typeof data === 'object' &&
+                    !(data instanceof ArrayBuffer) &&
+                    data.type === 'pcm-debug-raw'
+                ) {
+
+                    console.log(
+                        '★★★★★ [PCM RAW 48K]',
+                        'blocks=', data.blockCount,
+                        'samples=', data.windowSamples,
+                        'totalSamples=', data.totalSamples,
+                        'peak=', data.peak,
+                        'avgAbs=', data.avgAbs,
+                        'sampleRate=', data.sourceSampleRate,
+                        '★★★★★'
+                    );
+
+                    return;
+                }
+
+
+                // Worklet configuration diagnostic message.
+                if (
+                    data &&
+                    typeof data === 'object' &&
+                    !(data instanceof ArrayBuffer) &&
+                    data.type === 'pcm-debug-config'
+                ) {
+
+                    console.log(
+                        '★★★★★ [PCM WORKLET CONFIG]',
+                        data,
+                        '★★★★★'
+                    );
+
+                    return;
+                }
+
+
+                // Only ArrayBuffer messages are actual 16 kHz PCM16.
+                if (!(data instanceof ArrayBuffer)) {
+
+                    console.warn(
+                        '★★★★★ [PCM] UNKNOWN WORKLET MESSAGE - IGNORED ★★★★★',
+                        data
+                    );
+
+                    return;
+                }
+
+
                 const pcm =
-                    event.data as ArrayBuffer;
+                    data;
 
 
                 workletMessageCount++;
@@ -714,7 +772,7 @@ peerConnection.onconnectionstatechange =
                         'count=',
                         workletMessageCount,
                         'bytes=',
-                        pcm?.byteLength,
+                        pcm.byteLength,
                         '★★★★★'
                     );
                 }

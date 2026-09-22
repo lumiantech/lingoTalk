@@ -21,31 +21,14 @@ import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
+import java.util.concurrent.Executors
 
 @CapacitorPlugin(name = "SpeechRecognition")
-class SpeechRecognitionPlugin : Plugin() {
-
+class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
     companion object {
         private const val TAG = "LingoSpeech"
-
-        // How long we give an Android 12 RecognitionService
-        // to open EXTRA_AUDIO_INJECT_SOURCE.
         private const val SERVICE_TEST_DELAY_MS = 1500L
     }
-
-    private var speechRecognizer: SpeechRecognizer? = null
-
-    private val handler = Handler(Looper.getMainLooper())
-
-    private var keepListening = false
-
-    private var language = "hr-HR"
-
-    private val restartRunnable = Runnable { startRecognizer() }
-
-    // ============================================================
-    // ANDROID 12 RECOGNITION SERVICE TEST
-    // ============================================================
 
     private data class RecognitionServiceCandidate(
         val label: String,
@@ -53,964 +36,535 @@ class SpeechRecognitionPlugin : Plugin() {
         val className: String,
     )
 
-    /*
-     * These are the three RecognitionService implementations that
-     * were actually found on the Samsung S10e.
-     *
-     * We test them in this order:
-     *
-     * 0 - Google Voice Search
-     * 1 - Google TTS recognition service
-     * 2 - Samsung / Bixby
-     */
     private val android12RecognitionServices =
         listOf(
             RecognitionServiceCandidate(
-                label = "GOOGLE_VOICE_SEARCH",
-                packageName = "com.google.android.googlequicksearchbox",
-                className = "com.google.android.voicesearch.serviceapi.GoogleRecognitionService",
+                "GOOGLE_VOICE_SEARCH",
+                "com.google.android.googlequicksearchbox",
+                "com.google.android.voicesearch.serviceapi.GoogleRecognitionService",
             ),
             RecognitionServiceCandidate(
-                label = "GOOGLE_TTS",
-                packageName = "com.google.android.tts",
-                className =
-                    "com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService",
+                "GOOGLE_TTS",
+                "com.google.android.tts",
+                "com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService",
             ),
             RecognitionServiceCandidate(
-                label = "SAMSUNG_BIXBY",
-                packageName = "com.samsung.android.bixby.agent",
-                className =
-                    "com.samsung.android.bixby.agent.mainui.voiceinteraction.RecognitionServiceTrampoline",
+                "SAMSUNG_BIXBY",
+                "com.samsung.android.bixby.agent",
+                "com.samsung.android.bixby.agent.mainui.voiceinteraction.RecognitionServiceTrampoline",
             ),
         )
 
+    private val modelInstallerExecutor = Executors.newSingleThreadExecutor()
+    private val handler = Handler(Looper.getMainLooper())
+    private val restartRunnable = Runnable { startGoogleRecognizer() }
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var sherpa: SherpaStreamingRecognizer? = null
+    private var keepListening = false
+    private var language = "hr-HR"
+    private var sherpaActive = false
     private var currentServiceIndex = 0
-
     private var testingRecognitionServices = false
-
     private var selectedWorkingService: RecognitionServiceCandidate? = null
-
     private var serviceTestRunnable: Runnable? = null
 
-    // ============================================================
-    // CAPABILITIES
-    // ============================================================
+    override fun load() {
+        sherpa = SherpaStreamingRecognizer(context, this)
+    }
 
     @PluginMethod
     fun getCapabilities(call: PluginCall) {
-
-        val result = JSObject()
-
-        result.put("androidApi", Build.VERSION.SDK_INT)
-        result.put("androidVersion", Build.VERSION.RELEASE)
-        result.put("audioInjectionMode", getAudioInjectionMode())
-        result.put("supportsSharedAudio", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-
-        Log.d(
-            TAG,
-            "CAPABILITIES api=${Build.VERSION.SDK_INT}, " +
-                "android=${Build.VERSION.RELEASE}, " +
-                "mode=${getAudioInjectionMode()}",
+        call.resolve(
+            JSObject().apply {
+                put("androidApi", Build.VERSION.SDK_INT)
+                put("androidVersion", Build.VERSION.RELEASE)
+                put("audioInjectionMode", getAudioInjectionMode())
+                put("supportsSharedAudio", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+                put("sherpaFallback", true)
+            }
         )
-
-        call.resolve(result)
     }
 
-    // ============================================================
-    // START
-    // ============================================================
-
     @PluginMethod
-    fun start(call: PluginCall) {
+    fun prepareOfflineModel(call: PluginCall) {
 
-        language = call.getString("language", "hr-HR") ?: "hr-HR"
-
-        keepListening = true
-
-        Log.d(TAG, "START requested, language=$language")
-
-        activity.runOnUiThread {
-
-            // Diagnostic only.
-            logRecognitionServices()
-
-            /*
-             * Android 12 / 12L:
-             *
-             * We explicitly test installed RecognitionService
-             * implementations because EXTRA_AUDIO_INJECT_SOURCE
-             * is implementation-dependent.
-             *
-             * Android 13+:
-             *
-             * We keep using the normal SpeechRecognizer because
-             * the audio is supplied directly through
-             * EXTRA_AUDIO_SOURCE / ParcelFileDescriptor.
-             */
-            if (
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
-            ) {
-
-                if (selectedWorkingService != null) {
-
-                    Log.d(
-                        TAG,
-                        "★★★★★ USING PREVIOUSLY SELECTED SERVICE: " +
-                            "${selectedWorkingService!!.label} ★★★★★",
-                    )
-
-                    createRecognizerForService(selectedWorkingService!!)
-
-                    startRecognizer()
-                } else {
-
-                    startRecognitionServiceTest()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            call.resolve(
+                JSObject().apply {
+                    put("installed", false)
+                    put("required", false)
                 }
-            } else {
-
-                ensureRecognizer()
-
-                startRecognizer()
-            }
-
-            call.resolve()
+            )
+            return
         }
-    }
 
-    // ============================================================
-    // STOP
-    // ============================================================
+        if (SherpaModelInstaller.isInstalled(context)) {
 
-    @PluginMethod
-    fun stop(call: PluginCall) {
+            Log.i(TAG, "★★★★★ OFFLINE MODEL ALREADY READY ★★★★★")
 
-        Log.d(TAG, "STOP requested")
-
-        keepListening = false
-
-        testingRecognitionServices = false
-
-        handler.removeCallbacks(restartRunnable)
-
-        cancelServiceTestTimer()
-
-        activity.runOnUiThread {
-            try {
-
-                speechRecognizer?.stopListening()
-            } catch (exception: Exception) {
-
-                Log.d(TAG, "stopListening exception: ${exception.message}")
-            }
-
-            try {
-
-                speechRecognizer?.cancel()
-            } catch (exception: Exception) {
-
-                Log.d(TAG, "cancel exception: ${exception.message}")
-            }
-
-            destroyCurrentRecognizer()
-
-            SharedAudioStream.close()
-
-            sendState("stopped")
-
-            call.resolve()
-        }
-    }
-
-    // ============================================================
-    // PCM FROM ANGULAR / WEBRTC
-    // ============================================================
-
-    @PluginMethod
-    fun pushAudio(call: PluginCall) {
-
-        val base64 = call.getString("data")
-
-        if (base64 == null) {
-
-            call.reject("Missing audio data")
+            call.resolve(
+                JSObject().apply {
+                    put("installed", true)
+                    put("required", true)
+                }
+            )
 
             return
         }
 
-        try {
+        Log.i(TAG, "★★★★★ PREPARING OFFLINE MODEL BEFORE CALL ★★★★★")
 
-            val audioBytes = Base64.decode(base64, Base64.NO_WRAP)
+        sendState("model_installing", "sherpa")
 
-            Log.d(TAG, "pushAudio bytes=${audioBytes.size}")
+        modelInstallerExecutor.execute {
+            try {
 
-            SharedAudioStream.write(audioBytes)
+                SherpaModelInstaller.ensureInstalled(context) { progress ->
+                    Log.i(TAG, "★★★★★ OFFLINE MODEL INSTALL PROGRESS=$progress% ★★★★★")
 
-            call.resolve()
-        } catch (exception: Exception) {
+                    notifyListeners(
+                        "modelInstallProgress",
+                        JSObject().apply { put("progress", progress) },
+                    )
+                }
 
-            Log.e(TAG, "pushAudio failed: ${exception.message}", exception)
+                Log.i(TAG, "★★★★★ OFFLINE MODEL READY ★★★★★")
 
-            call.reject("Failed to push audio", exception)
+                sendState("model_ready", "sherpa")
+
+                call.resolve(
+                    JSObject().apply {
+                        put("installed", true)
+                        put("required", true)
+                    }
+                )
+            } catch (e: Exception) {
+
+                Log.e(TAG, "★★★★★ OFFLINE MODEL INSTALL FAILED ★★★★★", e)
+
+                sendState("model_install_failed", "sherpa")
+
+                notifyListeners(
+                    "error",
+                    JSObject().apply {
+                        put("engine", "sherpa")
+                        put("message", e.message ?: "Offline model installation failed")
+                    },
+                )
+
+                call.reject(e.message ?: "Offline model installation failed", e)
+            }
         }
     }
 
-    // ============================================================
-    // RECOGNITION SERVICE DIAGNOSTICS
-    // ============================================================
+    @PluginMethod
+    fun start(call: PluginCall) {
+        language = call.getString("language", "hr-HR") ?: "hr-HR"
+        keepListening = true
+        Log.i(TAG, "START language=$language api=${Build.VERSION.SDK_INT}")
+        activity.runOnUiThread {
+            logRecognitionServices()
+            if (Build.VERSION.SDK_INT in Build.VERSION_CODES.S until Build.VERSION_CODES.TIRAMISU) {
+                // Android 12/12L: Sherpa is the reliable PCM path. Google URI injection remains in
+                // parallel as a diagnostic/bonus path.
+                startSherpa()
+                if (selectedWorkingService != null) {
+                    createRecognizerForService(selectedWorkingService!!)
+                    startGoogleRecognizer()
+                } else {
+                    startRecognitionServiceTest()
+                }
+            } else {
+                // Android 13+: Google EXTRA_AUDIO_SOURCE first. Sherpa starts only if Google fails.
+                ensureRecognizer()
+                startGoogleRecognizer()
+            }
+            call.resolve()
+        }
+    }
+
+    @PluginMethod
+    fun stop(call: PluginCall) {
+        keepListening = false
+        testingRecognitionServices = false
+        handler.removeCallbacks(restartRunnable)
+        cancelServiceTestTimer()
+        sherpaActive = false
+        sherpa?.stop()
+        activity.runOnUiThread {
+            try {
+                speechRecognizer?.stopListening()
+            } catch (_: Exception) {}
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Exception) {}
+            destroyCurrentRecognizer()
+            SharedAudioStream.close()
+            sendState("stopped", "none")
+            call.resolve()
+        }
+    }
+
+    @PluginMethod
+    fun pushAudio(call: PluginCall) {
+        val base64 = call.getString("data") ?: return call.reject("Missing audio data")
+        try {
+            val bytes = Base64.decode(base64, Base64.NO_WRAP)
+            if (sherpaActive) sherpa?.acceptPcm16(bytes)
+            // Writes only when Google/provider has actually opened the pipe; otherwise
+            // SharedAudioStream safely drops it.
+            SharedAudioStream.write(bytes)
+            call.resolve()
+        } catch (e: Exception) {
+            Log.e(TAG, "pushAudio failed", e)
+            call.reject("Failed to push audio", e)
+        }
+    }
+
+    private fun startSherpa() {
+        if (sherpaActive) return
+        sherpaActive = true
+        sendState("sherpa_starting", "sherpa")
+        sherpa?.start(language)
+    }
+
+    override fun onSherpaReady(language: String) {
+        sendState("ready", "sherpa")
+    }
+
+    override fun onSherpaPartial(text: String, language: String) {
+        emitResult("partialResult", text, "sherpa", language, false)
+    }
+
+    override fun onSherpaFinal(text: String, language: String) {
+        emitResult("finalResult", text, "sherpa", language, true)
+    }
+
+    override fun onSherpaError(message: String) {
+        sherpaActive = false
+        notifyListeners(
+            "error",
+            JSObject().apply {
+                put("engine", "sherpa")
+                put("message", message)
+            },
+        )
+        sendState("sherpa_unavailable", "sherpa")
+    }
+
+    private fun emitResult(
+        event: String,
+        text: String,
+        engine: String,
+        resultLanguage: String,
+        isFinal: Boolean,
+    ) {
+        if (text.isBlank()) return
+        notifyListeners(
+            event,
+            JSObject().apply {
+                put("text", text)
+                put("engine", engine)
+                put("language", resultLanguage)
+                put("isFinal", isFinal)
+            },
+        )
+    }
+
+    private fun startRecognitionServiceTest() {
+        if (!keepListening) return
+        testingRecognitionServices = true
+        currentServiceIndex = 0
+        Log.i(TAG, "Starting API31/32 RecognitionService pipe test")
+        testCurrentRecognitionService()
+    }
+
+    private fun testCurrentRecognitionService() {
+        if (!keepListening || !testingRecognitionServices) return
+        if (currentServiceIndex >= android12RecognitionServices.size) {
+            testingRecognitionServices = false
+            sendState("recognition_service_test_failed", "google")
+            Log.w(
+                TAG,
+                "No API31/32 RecognitionService opened the shared-audio pipe; Sherpa remains active",
+            )
+            return
+        }
+        val candidate = android12RecognitionServices[currentServiceIndex]
+        cancelServiceTestTimer()
+        destroyCurrentRecognizer()
+        SharedAudioStream.close()
+        createRecognizerForService(candidate)
+        if (speechRecognizer == null) return moveToNextRecognitionService()
+        startGoogleRecognizer()
+        serviceTestRunnable =
+            Runnable { checkCurrentRecognitionService() }
+                .also { handler.postDelayed(it, SERVICE_TEST_DELAY_MS) }
+    }
+
+    private fun checkCurrentRecognitionService() {
+        serviceTestRunnable = null
+        if (!keepListening || !testingRecognitionServices) return
+        val candidate = android12RecognitionServices.getOrNull(currentServiceIndex) ?: return
+        if (SharedAudioStream.isOpen()) {
+            selectedWorkingService = candidate
+            testingRecognitionServices = false
+            Log.i(TAG, "API31/32 service ${candidate.label} opened audio pipe")
+            sendState("recognition_service_selected", "google")
+        } else {
+            Log.w(TAG, "API31/32 service ${candidate.label} did not open audio pipe")
+            moveToNextRecognitionService()
+        }
+    }
+
+    private fun moveToNextRecognitionService() {
+        cancelServiceTestTimer()
+        try {
+            speechRecognizer?.cancel()
+        } catch (_: Exception) {}
+        destroyCurrentRecognizer()
+        SharedAudioStream.close()
+        currentServiceIndex++
+        handler.postDelayed({ testCurrentRecognitionService() }, 300L)
+    }
+
+    private fun cancelServiceTestTimer() {
+        serviceTestRunnable?.let(handler::removeCallbacks)
+        serviceTestRunnable = null
+    }
+
+    private fun createRecognizerForService(candidate: RecognitionServiceCandidate) {
+        try {
+            val component = ComponentName(candidate.packageName, candidate.className)
+            speechRecognizer =
+                SpeechRecognizer.createSpeechRecognizer(context, component).also {
+                    it.setRecognitionListener(recognitionListener)
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create ${candidate.label}", e)
+            speechRecognizer = null
+        }
+    }
+
+    private fun ensureRecognizer() {
+        if (speechRecognizer != null) return
+        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+            notifyListeners(
+                "error",
+                JSObject().apply {
+                    put("engine", "google")
+                    put("message", "Speech recognition is not available")
+                },
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
+            return
+        }
+        try {
+            speechRecognizer =
+                SpeechRecognizer.createSpeechRecognizer(context).also {
+                    it.setRecognitionListener(recognitionListener)
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create SpeechRecognizer", e)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
+        }
+    }
+
+    private fun configureSharedAudio(intent: Intent) {
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                val audioSource = SharedAudioStream.createPipe()
+                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSource)
+                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+                intent.putExtra(
+                    RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                )
+                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                val uri = Uri.parse("content://${context.packageName}.speech.audio/live")
+                @Suppress("DEPRECATION")
+                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_INJECT_SOURCE, uri)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+    }
+
+    private val recognitionListener =
+        object : RecognitionListener {
+            override fun onReadyForSpeech(params: Bundle?) = sendState("ready", "google")
+
+            override fun onBeginningOfSpeech() = sendState("speaking", "google")
+
+            override fun onRmsChanged(rmsdB: Float) {}
+
+            override fun onBufferReceived(buffer: ByteArray?) {}
+
+            override fun onEndOfSpeech() = sendState("processing", "google")
+
+            override fun onError(error: Int) {
+                Log.w(TAG, "Google error $error: ${errorMessage(error)}")
+                notifyListeners(
+                    "error",
+                    JSObject().apply {
+                        put("engine", "google")
+                        put("code", error)
+                        put("message", errorMessage(error))
+                    },
+                )
+                if (!keepListening || testingRecognitionServices) return
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    // Once API33+ Google fails, keep the same WebRTC PCM source and move to Sherpa.
+                    try {
+                        speechRecognizer?.cancel()
+                    } catch (_: Exception) {}
+                    destroyCurrentRecognizer()
+                    SharedAudioStream.close()
+                    startSherpa()
+                    return
+                }
+                restartAfter(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1000L else 300L)
+            }
+
+            override fun onResults(results: Bundle?) {
+                val text =
+                    results
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        .orEmpty()
+                if (text.isNotBlank()) emitResult("finalResult", text, "google", language, true)
+                if (keepListening && !testingRecognitionServices && !sherpaActive)
+                    restartAfter(250L)
+            }
+
+            override fun onPartialResults(partialResults: Bundle?) {
+                val text =
+                    partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        .orEmpty()
+                if (text.isNotBlank()) emitResult("partialResult", text, "google", language, false)
+            }
+
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        }
+
+    private fun startGoogleRecognizer() {
+        if (!keepListening) return
+        val recognizer = speechRecognizer ?: return
+        handler.removeCallbacks(restartRunnable)
+        val intent =
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                )
+                if (!language.equals("auto", true))
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            }
+        configureSharedAudio(intent)
+        try {
+            recognizer.startListening(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Google startListening failed", e)
+            if (testingRecognitionServices) moveToNextRecognitionService()
+            else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
+            else restartAfter(1000L)
+        }
+    }
+
+    private fun restartAfter(ms: Long) {
+        handler.removeCallbacks(restartRunnable)
+        handler.postDelayed(restartRunnable, ms)
+    }
+
+    private fun destroyCurrentRecognizer() {
+        try {
+            speechRecognizer?.cancel()
+        } catch (_: Exception) {}
+        try {
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+    }
+
+    private fun sendState(state: String, engine: String) {
+        notifyListeners(
+            "stateChanged",
+            JSObject().apply {
+                put("state", state)
+                put("engine", engine)
+            },
+        )
+    }
+
+    private fun errorMessage(error: Int) =
+        when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+            SpeechRecognizer.ERROR_CLIENT -> "Client error"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission missing"
+            SpeechRecognizer.ERROR_NETWORK -> "Network error"
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+            SpeechRecognizer.ERROR_NO_MATCH -> "No speech match"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer busy"
+            SpeechRecognizer.ERROR_SERVER -> "Speech recognition server error"
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
+            else -> "Speech recognition error $error"
+        }
+
+    private fun getAudioInjectionMode() =
+        when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> "AUDIO_SOURCE_API_33"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> "AUDIO_INJECT_SOURCE_API_31"
+            else -> "UNSUPPORTED"
+        }
 
     private fun logRecognitionServices() {
-
         try {
-
             val defaultService =
                 Settings.Secure.getString(context.contentResolver, "voice_recognition_service")
-
-            Log.d(TAG, "★★★★★ DEFAULT RECOGNITION SERVICE = " + "${defaultService ?: "NONE"} ★★★★★")
-
-            val serviceIntent = Intent(RecognitionService.SERVICE_INTERFACE)
-
+            Log.d(TAG, "Default recognition service=${defaultService ?: "NONE"}")
+            val intent = Intent(RecognitionService.SERVICE_INTERFACE)
             val services =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-
                     context.packageManager.queryIntentServices(
-                        serviceIntent,
+                        intent,
                         PackageManager.ResolveInfoFlags.of(
                             PackageManager.MATCH_DEFAULT_ONLY.toLong()
                         ),
                     )
                 } else {
-
                     @Suppress("DEPRECATION")
                     context.packageManager.queryIntentServices(
-                        serviceIntent,
+                        intent,
                         PackageManager.MATCH_DEFAULT_ONLY,
                     )
                 }
-
-            Log.d(TAG, "★★★★★ AVAILABLE RECOGNITION SERVICES = " + "${services.size} ★★★★★")
-
-            services.forEachIndexed { index, resolveInfo ->
-                val serviceInfo = resolveInfo.serviceInfo
-
+            services.forEach {
                 Log.d(
                     TAG,
-                    "★★★★★ RECOGNITION SERVICE [$index] = " +
-                        "${serviceInfo.packageName}/" +
-                        "${serviceInfo.name} ★★★★★",
+                    "Recognition service=${it.serviceInfo.packageName}/${it.serviceInfo.name}",
                 )
             }
-        } catch (exception: Exception) {
-
-            Log.e(TAG, "★★★★★ FAILED TO QUERY RECOGNITION SERVICES ★★★★★", exception)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to query recognition services", e)
         }
     }
-
-    // ============================================================
-    // ANDROID 12 SERVICE TEST
-    // ============================================================
-
-    private fun startRecognitionServiceTest() {
-
-        if (!keepListening) {
-
-            return
-        }
-
-        testingRecognitionServices = true
-
-        currentServiceIndex = 0
-
-        Log.d(TAG, "============================================================")
-
-        Log.d(TAG, "★★★★★ STARTING ANDROID 12 RECOGNITION SERVICE TEST ★★★★★")
-
-        Log.d(TAG, "★★★★★ SERVICES TO TEST = " + "${android12RecognitionServices.size} ★★★★★")
-
-        Log.d(TAG, "============================================================")
-
-        testCurrentRecognitionService()
-    }
-
-    private fun testCurrentRecognitionService() {
-
-        if (!keepListening) {
-
-            return
-        }
-
-        if (!testingRecognitionServices) {
-
-            return
-        }
-
-        if (currentServiceIndex >= android12RecognitionServices.size) {
-
-            Log.e(TAG, "============================================================")
-
-            Log.e(TAG, "★★★★★ ALL RECOGNITION SERVICES TESTED ★★★★★")
-
-            Log.e(
-                TAG,
-                "★★★★★ NO SERVICE HAS YET BEEN CONFIRMED " + "FOR API 31 AUDIO INJECTION ★★★★★",
-            )
-
-            Log.e(TAG, "============================================================")
-
-            testingRecognitionServices = false
-
-            sendState("recognition_service_test_failed")
-
-            return
-        }
-
-        val candidate = android12RecognitionServices[currentServiceIndex]
-
-        Log.d(TAG, "============================================================")
-
-        Log.d(
-            TAG,
-            "★★★★★ TESTING SERVICE " +
-                "${currentServiceIndex + 1}/" +
-                "${android12RecognitionServices.size} ★★★★★",
-        )
-
-        Log.d(TAG, "★★★★★ LABEL = ${candidate.label} ★★★★★")
-
-        Log.d(
-            TAG,
-            "★★★★★ COMPONENT = " + "${candidate.packageName}/" + "${candidate.className} ★★★★★",
-        )
-
-        Log.d(TAG, "============================================================")
-
-        cancelServiceTestTimer()
-
-        destroyCurrentRecognizer()
-
-        SharedAudioStream.close()
-
-        createRecognizerForService(candidate)
-
-        if (speechRecognizer == null) {
-
-            Log.e(TAG, "★★★★★ FAILED TO CREATE ${candidate.label} ★★★★★")
-
-            moveToNextRecognitionService()
-
-            return
-        }
-
-        startRecognizer()
-
-        /*
-         * We give the service a short period in which to consume
-         * EXTRA_AUDIO_INJECT_SOURCE and therefore call our
-         * SharedAudioProvider.openFile().
-         *
-         * SharedAudioStream will tell us whether the pipe became
-         * writable.
-         */
-        val runnable = Runnable { checkCurrentRecognitionService() }
-
-        serviceTestRunnable = runnable
-
-        handler.postDelayed(runnable, SERVICE_TEST_DELAY_MS)
-    }
-
-    private fun checkCurrentRecognitionService() {
-
-        serviceTestRunnable = null
-
-        if (!keepListening) {
-
-            return
-        }
-
-        if (!testingRecognitionServices) {
-
-            return
-        }
-
-        val candidate = android12RecognitionServices.getOrNull(currentServiceIndex) ?: return
-
-        val pipeOpen = SharedAudioStream.isOpen()
-
-        if (pipeOpen) {
-
-            selectedWorkingService = candidate
-
-            testingRecognitionServices = false
-
-            Log.d(TAG, "============================================================")
-
-            Log.d(TAG, "★★★★★ SERVICE PASSED ★★★★★")
-
-            Log.d(TAG, "★★★★★ ${candidate.label} OPENED AUDIO PIPE ★★★★★")
-
-            Log.d(
-                TAG,
-                "★★★★★ COMPONENT = " + "${candidate.packageName}/" + "${candidate.className} ★★★★★",
-            )
-
-            Log.d(TAG, "============================================================")
-
-            sendState("recognition_service_selected")
-
-            return
-        }
-
-        Log.e(TAG, "============================================================")
-
-        Log.e(TAG, "★★★★★ SERVICE FAILED PIPE TEST ★★★★★")
-
-        Log.e(TAG, "★★★★★ ${candidate.label} DID NOT OPEN AUDIO PIPE ★★★★★")
-
-        Log.e(TAG, "============================================================")
-
-        moveToNextRecognitionService()
-    }
-
-    private fun moveToNextRecognitionService() {
-
-        cancelServiceTestTimer()
-
-        try {
-
-            speechRecognizer?.cancel()
-        } catch (exception: Exception) {
-
-            Log.d(TAG, "cancel before next service: ${exception.message}")
-        }
-
-        destroyCurrentRecognizer()
-
-        SharedAudioStream.close()
-
-        currentServiceIndex++
-
-        handler.postDelayed({ testCurrentRecognitionService() }, 300L)
-    }
-
-    private fun cancelServiceTestTimer() {
-
-        serviceTestRunnable?.let { handler.removeCallbacks(it) }
-
-        serviceTestRunnable = null
-    }
-
-    // ============================================================
-    // CREATE SPECIFIC RECOGNITION SERVICE
-    // ============================================================
-
-    private fun createRecognizerForService(candidate: RecognitionServiceCandidate) {
-
-        try {
-
-            val component = ComponentName(candidate.packageName, candidate.className)
-
-            Log.d(TAG, "★★★★★ CREATING RECOGNIZER FOR " + "${candidate.label}: $component ★★★★★")
-
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context, component)
-
-            speechRecognizer?.setRecognitionListener(recognitionListener)
-
-            Log.d(TAG, "★★★★★ RECOGNIZER CREATED FOR " + "${candidate.label} ★★★★★")
-        } catch (exception: Exception) {
-
-            Log.e(
-                TAG,
-                "★★★★★ FAILED TO CREATE RECOGNIZER FOR " + "${candidate.label} ★★★★★",
-                exception,
-            )
-
-            speechRecognizer = null
-        }
-    }
-
-    // ============================================================
-    // SHARED AUDIO CONFIGURATION
-    //
-    // Android 13+:
-    //      EXTRA_AUDIO_SOURCE
-    //
-    // Android 12 / 12L:
-    //      EXTRA_AUDIO_INJECT_SOURCE
-    //
-    // ============================================================
-
-    private fun configureSharedAudio(intent: Intent) {
-
-        when {
-
-            // ----------------------------------------------------
-            // ANDROID 13+
-            // API 33+
-            // ----------------------------------------------------
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-
-                Log.d(TAG, "Using API 33+ EXTRA_AUDIO_SOURCE")
-
-                val audioSource = SharedAudioStream.createPipe()
-
-                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSource)
-
-                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
-
-                intent.putExtra(
-                    RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                )
-
-                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
-
-                Log.d(TAG, "API 33+ audio source configured: " + "PCM16 mono 16000Hz")
-            }
-
-            // ----------------------------------------------------
-            // ANDROID 12 / 12L
-            // API 31–32
-            // ----------------------------------------------------
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-
-                val audioUri =
-                    Uri.parse("content://" + "${context.packageName}" + ".speech.audio/live")
-
-                Log.d(TAG, "Using API 31 shared audio URI: $audioUri")
-
-                @Suppress("DEPRECATION")
-                intent.putExtra(RecognizerIntent.EXTRA_AUDIO_INJECT_SOURCE, audioUri)
-
-                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-
-            // ----------------------------------------------------
-            // ANDROID 11 AND OLDER
-            // ----------------------------------------------------
-
-            else -> {
-
-                Log.d(
-                    TAG,
-                    "Shared audio injection unsupported " +
-                        "on Android API ${Build.VERSION.SDK_INT}",
-                )
-            }
-        }
-    }
-
-    // ============================================================
-    // CREATE DEFAULT SPEECH RECOGNIZER
-    // ============================================================
-
-    private fun ensureRecognizer() {
-
-        if (speechRecognizer != null) {
-
-            Log.d(TAG, "SpeechRecognizer already exists")
-
-            return
-        }
-
-        val available = SpeechRecognizer.isRecognitionAvailable(context)
-
-        Log.d(TAG, "Recognition available=$available")
-
-        if (!available) {
-
-            val data = JSObject()
-
-            data.put("message", "Speech recognition is not available.")
-
-            notifyListeners("error", data)
-
-            return
-        }
-
-        try {
-
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
-
-            speechRecognizer?.setRecognitionListener(recognitionListener)
-
-            Log.d(TAG, "SpeechRecognizer created")
-        } catch (exception: Exception) {
-
-            Log.e(TAG, "Failed to create SpeechRecognizer", exception)
-
-            speechRecognizer = null
-
-            val data = JSObject()
-
-            data.put("message", exception.message ?: "Failed to create speech recognizer")
-
-            notifyListeners("error", data)
-        }
-    }
-
-    // ============================================================
-    // DESTROY CURRENT RECOGNIZER
-    // ============================================================
-
-    private fun destroyCurrentRecognizer() {
-
-        try {
-
-            speechRecognizer?.cancel()
-        } catch (exception: Exception) {
-
-            Log.d(TAG, "cancel during destroy: ${exception.message}")
-        }
-
-        try {
-
-            speechRecognizer?.destroy()
-        } catch (exception: Exception) {
-
-            Log.d(TAG, "destroyCurrentRecognizer exception: " + "${exception.message}")
-        }
-
-        speechRecognizer = null
-    }
-
-    // ============================================================
-    // RECOGNITION LISTENER
-    // ============================================================
-
-    private val recognitionListener =
-        object : RecognitionListener {
-
-            override fun onReadyForSpeech(params: Bundle?) {
-
-                Log.d(TAG, "READY FOR SPEECH")
-
-                sendState("ready")
-            }
-
-            override fun onBeginningOfSpeech() {
-
-                Log.d(TAG, "BEGINNING OF SPEECH")
-
-                sendState("speaking")
-            }
-
-            override fun onRmsChanged(rmsdB: Float) {
-
-                Log.d(TAG, "RMS: $rmsdB")
-            }
-
-            override fun onBufferReceived(buffer: ByteArray?) {
-
-                Log.d(TAG, "BUFFER RECEIVED size=${buffer?.size ?: 0}")
-            }
-
-            override fun onEndOfSpeech() {
-
-                Log.d(TAG, "END OF SPEECH")
-
-                sendState("processing")
-            }
-
-            override fun onError(error: Int) {
-
-                Log.d(TAG, "ERROR $error: ${errorMessage(error)}")
-
-                val data = JSObject()
-
-                data.put("code", error)
-
-                data.put("message", errorMessage(error))
-
-                notifyListeners("error", data)
-
-                if (!keepListening) {
-
-                    return
-                }
-
-                /*
-                 * While we are testing Android 12 services,
-                 * the service-test controller owns the transition
-                 * to the next recognizer.
-                 *
-                 * Do NOT start the normal restart loop here.
-                 */
-                if (testingRecognitionServices) {
-
-                    Log.d(
-                        TAG,
-                        "Error occurred during RecognitionService test; " +
-                            "waiting for pipe-test decision",
-                    )
-
-                    return
-                }
-
-                val delay =
-                    if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-
-                        1000L
-                    } else {
-
-                        300L
-                    }
-
-                Log.d(TAG, "Restart after error in ${delay}ms")
-
-                restartAfter(delay)
-            }
-
-            override fun onResults(results: Bundle?) {
-
-                val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-
-                Log.d(TAG, "RESULTS: $matches")
-
-                if (!matches.isNullOrEmpty()) {
-
-                    val data = JSObject()
-
-                    data.put("text", matches[0])
-
-                    notifyListeners("finalResult", data)
-                }
-
-                if (!keepListening) {
-
-                    return
-                }
-
-                if (testingRecognitionServices) {
-
-                    Log.d(TAG, "Result received during RecognitionService test")
-
-                    return
-                }
-
-                Log.d(TAG, "Restart after final result")
-
-                restartAfter(250L)
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-
-                val matches =
-                    partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-
-                Log.d(TAG, "PARTIAL: $matches")
-
-                if (matches.isNullOrEmpty()) {
-
-                    return
-                }
-
-                val data = JSObject()
-
-                data.put("text", matches[0])
-
-                notifyListeners("partialResult", data)
-            }
-
-            override fun onEvent(eventType: Int, params: Bundle?) {
-
-                Log.d(TAG, "EVENT type=$eventType")
-            }
-        }
-
-    // ============================================================
-    // START RECOGNIZER
-    // ============================================================
-
-    private fun startRecognizer() {
-
-        if (!keepListening) {
-
-            Log.d(TAG, "startRecognizer ignored: keepListening=false")
-
-            return
-        }
-
-        val recognizer = speechRecognizer
-
-        if (recognizer == null) {
-
-            Log.d(TAG, "startRecognizer failed: recognizer=null")
-
-            return
-        }
-
-        handler.removeCallbacks(restartRunnable)
-
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-
-        intent.putExtra(
-            RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-            RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-        )
-
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
-
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-
-        // Android 12 / Android 13+ shared audio
-        configureSharedAudio(intent)
-
-        val serviceLabel =
-            selectedWorkingService?.label
-                ?: if (
-                    testingRecognitionServices &&
-                        currentServiceIndex < android12RecognitionServices.size
-                ) {
-
-                    android12RecognitionServices[currentServiceIndex].label
-                } else {
-
-                    "DEFAULT"
-                }
-
-        Log.d(
-            TAG,
-            "Calling startListening(), " +
-                "language=$language, " +
-                "api=${Build.VERSION.SDK_INT}, " +
-                "mode=${getAudioInjectionMode()}, " +
-                "service=$serviceLabel",
-        )
-
-        try {
-
-            recognizer.startListening(intent)
-        } catch (exception: Exception) {
-
-            Log.e(TAG, "startListening exception: ${exception.message}", exception)
-
-            val data = JSObject()
-
-            data.put("message", exception.message ?: "Speech recognition error")
-
-            notifyListeners("error", data)
-
-            if (!keepListening) {
-
-                return
-            }
-
-            if (testingRecognitionServices) {
-
-                Log.e(TAG, "startListening failed during service test")
-
-                moveToNextRecognitionService()
-
-                return
-            }
-
-            restartAfter(1000L)
-        }
-    }
-
-    // ============================================================
-    // RESTART
-    // ============================================================
-
-    private fun restartAfter(milliseconds: Long) {
-
-        handler.removeCallbacks(restartRunnable)
-
-        handler.postDelayed(restartRunnable, milliseconds)
-    }
-
-    // ============================================================
-    // STATE
-    // ============================================================
-
-    private fun sendState(state: String) {
-
-        Log.d(TAG, "STATE: $state")
-
-        val data = JSObject()
-
-        data.put("state", state)
-
-        notifyListeners("stateChanged", data)
-    }
-
-    // ============================================================
-    // ERROR TEXT
-    // ============================================================
-
-    private fun errorMessage(error: Int): String {
-
-        return when (error) {
-            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
-
-            SpeechRecognizer.ERROR_CLIENT -> "Client error"
-
-            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission missing"
-
-            SpeechRecognizer.ERROR_NETWORK -> "Network error"
-
-            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-
-            SpeechRecognizer.ERROR_NO_MATCH -> "No speech match"
-
-            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer busy"
-
-            SpeechRecognizer.ERROR_SERVER -> "Speech recognition server error"
-
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
-
-            else -> "Speech recognition error $error"
-        }
-    }
-
-    // ============================================================
-    // AUDIO MODE
-    // ============================================================
-
-    private fun getAudioInjectionMode(): String {
-
-        return when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-
-                "AUDIO_SOURCE_API_33"
-            }
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-
-                "AUDIO_INJECT_SOURCE_API_31"
-            }
-
-            else -> {
-
-                "UNSUPPORTED"
-            }
-        }
-    }
-
-    // ============================================================
-    // DESTROY
-    // ============================================================
 
     override fun handleOnDestroy() {
-
-        Log.d(TAG, "DESTROY")
-
         keepListening = false
-
         testingRecognitionServices = false
-
         handler.removeCallbacks(restartRunnable)
-
         cancelServiceTestTimer()
-
         destroyCurrentRecognizer()
-
         SharedAudioStream.close()
-
+        sherpa?.release()
+        sherpa = null
+        modelInstallerExecutor.shutdownNow()
         super.handleOnDestroy()
     }
 }

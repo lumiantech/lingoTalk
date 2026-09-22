@@ -15,6 +15,15 @@
     {{ joined() ? 'Connected' : 'Join conversation' }}
   </ion-button>
 
+  <ion-item>
+    <ion-select label="My spoken language" labelPlacement="stacked" [(ngModel)]="selectedLanguage"
+      (ionChange)="languageChanged()">
+      @for (language of languages; track language.code) {
+      <ion-select-option [value]="language.code">{{ language.name }}</ion-select-option>
+      }
+    </ion-select>
+  </ion-item>
+
   <div class="video-container">
 
     <div class="remote-video-container">
@@ -37,7 +46,7 @@
 
   <div class="call-controls">
 
-    <ion-button [disabled]="!joined()" (click)="startCall()">
+    <ion-button [disabled]="!joined() || !speech.modelReady()" (click)="startCall()">
       Start call
     </ion-button>
 
@@ -52,9 +61,23 @@
     {{ webRtc.callState() }}
   </div>
   <div>
-    STT state:
-    {{ speech.state() }}
+    STT state: {{ speech.state() }} · engine: {{ speech.engine() }} · language: {{ speech.language() }}
   </div>
+
+  @if (speech.modelInstalling()) {
+  <div>
+    Installing offline speech model:
+    {{ speech.modelInstallProgress() }}%
+  </div>
+  }
+
+  @if (speech.modelReady()) {
+  <div>
+    Offline speech model: Ready
+  </div>
+  }
+
+
 
   <div>
     Partial:

@@ -9,6 +9,8 @@ import {
   IonItem,
   IonLabel,
   IonList,
+  IonSelect,
+  IonSelectOption,
   IonTitle,
   IonToolbar
 } from '@ionic/angular';
@@ -16,6 +18,7 @@ import { TranslationSignalRService } from '../../../core/services/translation-si
 import { environment } from '../../../../environments/environment';
 import { WebRtcService } from '../../../core/services/web-rtc.service';
 import { SpeechRecognitionService } from '../../../core/services/speech-recognition.service';
+
 
 
 
@@ -41,7 +44,9 @@ interface ConversationMessage {
     IonLabel,
     IonInput,
     IonButton,
-    IonList
+    IonList,
+    IonSelect,
+    IonSelectOption
   ]
 })
 export class ConversationPageComponent implements OnDestroy {
@@ -67,12 +72,10 @@ export class ConversationPageComponent implements OnDestroy {
       if (callConnected) {
 
         console.log(
-          '★★★★★ STARTING STT hr-HR ★★★★★'
+          '★★★★★ STARTING STT', this.selectedLanguage, '★★★★★'
         );
 
-        void this.speech.start(
-          'hr-HR'
-        );
+        void this.speech.start(this.selectedLanguage);
 
       } else {
 
@@ -106,8 +109,29 @@ export class ConversationPageComponent implements OnDestroy {
   readonly webRtc = inject(WebRtcService);
   readonly speech = inject(SpeechRecognitionService);
 
+  readonly languages = [
+    { code: 'auto', name: 'Auto detect' },
+    { code: 'en-US', name: 'English' },
+    { code: 'de-DE', name: 'Deutsch' },
+    { code: 'es-ES', name: 'Español' },
+    { code: 'fr-FR', name: 'Français' },
+    { code: 'it-IT', name: 'Italiano' },
+    { code: 'pt-PT', name: 'Português' },
+    { code: 'ar-AR', name: 'العربية' },
+    { code: 'ru-RU', name: 'Русский' },
+    { code: 'hr-HR', name: 'Hrvatski' }
+  ];
+
+  selectedLanguage = localStorage.getItem('lingo-language') ?? 'hr-HR';
   sessionId = '';
   messageText = '';
+
+  async languageChanged(): Promise<void> {
+    localStorage.setItem('lingo-language', this.selectedLanguage);
+    if (this.webRtc.callConnected()) {
+      await this.speech.restart(this.selectedLanguage);
+    }
+  }
 
   connected = signal(false);
   joined = signal(false);

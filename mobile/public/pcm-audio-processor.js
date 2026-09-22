@@ -33,7 +33,46 @@ class PcmAudioProcessor extends AudioWorkletProcessor {
         this.resampleRatio =
             this.sourceSampleRate /
             this.targetSampleRate;
+
+
+        // ============================================================
+        // RAW INPUT DIAGNOSTICS
+        //
+        // This does NOT modify audio.
+        // It only measures the original input received by the worklet
+        // BEFORE resampling from 48 kHz -> 16 kHz.
+        // ============================================================
+
+        this.rawBlockCount = 0;
+        this.rawSampleCount = 0;
+
+        this.rawWindowSamples = 0;
+        this.rawWindowAbsSum = 0;
+        this.rawWindowPeak = 0;
+
+        // Report approximately every 100 ms.
+        this.rawReportSamples =
+            Math.max(
+                1,
+                Math.round(
+                    this.sourceSampleRate *
+                    this.chunkDurationMs /
+                    1000
+                )
+            );
+
+
+        // Tell the main thread what configuration the worklet is using.
+        this.port.postMessage({
+            type: 'pcm-debug-config',
+            sourceSampleRate: this.sourceSampleRate,
+            targetSampleRate: this.targetSampleRate,
+            chunkDurationMs: this.chunkDurationMs,
+            chunkSamples: this.chunkSamples,
+            resampleRatio: this.resampleRatio
+        });
     }
+
 
     process(inputs) {
 
@@ -55,12 +94,110 @@ class PcmAudioProcessor extends AudioWorkletProcessor {
             return true;
         }
 
+
+        // ============================================================
+        // IMPORTANT:
+        // Measure RAW microphone/WebAudio samples BEFORE resampling.
+        //
+        // We do not modify channel[].
+        // ============================================================
+
+        this.measureRawInput(
+            channel
+        );
+
+
+        // Existing audio path remains unchanged.
+
         this.processInput(
             channel
         );
 
         return true;
     }
+
+
+    measureRawInput(input) {
+
+        this.rawBlockCount++;
+
+        for (
+            let index = 0;
+            index < input.length;
+            index++
+        ) {
+
+            const sample =
+                input[index];
+
+            const absolute =
+                Math.abs(
+                    sample
+                );
+
+            this.rawWindowSamples++;
+
+            this.rawSampleCount++;
+
+            this.rawWindowAbsSum +=
+                absolute;
+
+            if (
+                absolute >
+                this.rawWindowPeak
+            ) {
+
+                this.rawWindowPeak =
+                    absolute;
+            }
+        }
+
+
+        // Send one diagnostic report for approximately every
+        // chunkDurationMs of original source audio.
+
+        if (
+            this.rawWindowSamples >=
+            this.rawReportSamples
+        ) {
+
+            const averageAbsolute =
+                this.rawWindowSamples > 0
+                    ? this.rawWindowAbsSum /
+                      this.rawWindowSamples
+                    : 0;
+
+            this.port.postMessage({
+                type: 'pcm-debug-raw',
+
+                blockCount:
+                    this.rawBlockCount,
+
+                totalSamples:
+                    this.rawSampleCount,
+
+                windowSamples:
+                    this.rawWindowSamples,
+
+                peak:
+                    this.rawWindowPeak,
+
+                avgAbs:
+                    averageAbsolute,
+
+                sourceSampleRate:
+                    this.sourceSampleRate
+            });
+
+
+            this.rawWindowSamples = 0;
+
+            this.rawWindowAbsSum = 0;
+
+            this.rawWindowPeak = 0;
+        }
+    }
+
 
     processInput(input) {
 
@@ -126,6 +263,7 @@ class PcmAudioProcessor extends AudioWorkletProcessor {
         }
     }
 
+
     sendPcm16(samples) {
 
         const pcm =
@@ -162,6 +300,7 @@ class PcmAudioProcessor extends AudioWorkletProcessor {
         );
     }
 }
+
 
 registerProcessor(
     'pcm-audio-processor',
