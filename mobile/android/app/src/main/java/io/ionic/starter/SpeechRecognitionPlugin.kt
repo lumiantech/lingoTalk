@@ -14,7 +14,6 @@ import android.speech.RecognitionListener
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.util.Base64
 import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -60,6 +59,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
     private val restartRunnable = Runnable { startGoogleRecognizer() }
     private var speechRecognizer: SpeechRecognizer? = null
     private var sherpa: SherpaStreamingRecognizer? = null
+    private var nativeSherpaAudio: NativeSherpaAudioCapture? = null
     private var keepListening = false
     private var language = "hr-HR"
     private var sherpaActive = false
@@ -70,6 +70,26 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
 
     override fun load() {
         sherpa = SherpaStreamingRecognizer(context, this)
+
+        nativeSherpaAudio =
+            NativeSherpaAudioCapture(
+                context = context,
+                onPcm = { bytes ->
+                    if (sherpaActive) {
+                        sherpa?.acceptPcm16(bytes)
+                    }
+                },
+                onError = { message ->
+                    Log.e(TAG, "Native Sherpa microphone error: $message")
+                    notifyListeners(
+                        "error",
+                        JSObject().apply {
+                            put("engine", "sherpa")
+                            put("message", message)
+                        },
+                    )
+                },
+            )
     }
 
     @PluginMethod
@@ -190,6 +210,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         handler.removeCallbacks(restartRunnable)
         cancelServiceTestTimer()
         sherpaActive = false
+        nativeSherpaAudio?.stop()
         sherpa?.stop()
         activity.runOnUiThread {
             try {
@@ -205,22 +226,6 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         }
     }
 
-    @PluginMethod
-    fun pushAudio(call: PluginCall) {
-        val base64 = call.getString("data") ?: return call.reject("Missing audio data")
-        try {
-            val bytes = Base64.decode(base64, Base64.NO_WRAP)
-            if (sherpaActive) sherpa?.acceptPcm16(bytes)
-            // Writes only when Google/provider has actually opened the pipe; otherwise
-            // SharedAudioStream safely drops it.
-            SharedAudioStream.write(bytes)
-            call.resolve()
-        } catch (e: Exception) {
-            Log.e(TAG, "pushAudio failed", e)
-            call.reject("Failed to push audio", e)
-        }
-    }
-
     private fun startSherpa() {
         if (sherpaActive) return
         sherpaActive = true
@@ -229,6 +234,8 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
     }
 
     override fun onSherpaReady(language: String) {
+        Log.i(TAG, "★★★★★ SHERPA READY -> START NATIVE STT MICROPHONE ★★★★★")
+        nativeSherpaAudio?.start()
         sendState("ready", "sherpa")
     }
 
@@ -242,6 +249,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
 
     override fun onSherpaError(message: String) {
         sherpaActive = false
+        nativeSherpaAudio?.stop()
         notifyListeners(
             "error",
             JSObject().apply {
@@ -562,6 +570,8 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         cancelServiceTestTimer()
         destroyCurrentRecognizer()
         SharedAudioStream.close()
+        nativeSherpaAudio?.stop()
+        nativeSherpaAudio = null
         sherpa?.release()
         sherpa = null
         modelInstallerExecutor.shutdownNow()

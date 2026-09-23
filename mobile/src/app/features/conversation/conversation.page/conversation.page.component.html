@@ -1,210 +1,252 @@
 <ion-content [fullscreen]="true" class="conversation-content">
+  <div class="lingo-shell" [class.theme-indigo]="colorTheme() === 'indigo'">
 
-  @if (!webRtc.callConnected()) {
+    @if (!webRtc.callConnected()) {
     <div class="chat-screen">
+      <header class="brand-header">
+        <button class="brand-wave" type="button" aria-label="Lumian Lingo Talk">
+          <span></span><span></span><span></span><span></span><span></span>
+        </button>
 
-      <header class="chat-header">
-        <button class="header-icon back-button" type="button" aria-label="Back">‹</button>
-
-        <div class="contact-avatar">L</div>
-
-        <div class="contact-info">
-          <div class="contact-name">Lumian Lingo</div>
-          <div class="contact-status">
-            @if (joined()) {
-              {{ remoteLanguage() ? ('Online · ' + remoteLanguage()) : 'Waiting for participant...' }}
-            } @else {
-              Offline
-            }
-          </div>
+        <div class="brand-copy">
+          <div class="brand-name">Lumian</div>
+          <div class="brand-subtitle">Lingo Talk</div>
         </div>
 
-        <!-- VIDEO CALL -->
-        <button
-          class="header-icon"
-          type="button"
-          aria-label="Video call"
-          [disabled]="!joined() || !speech.modelReady()"
-          (click)="startCall()">
+        <button class="round-icon settings-button" type="button" aria-label="Change color theme"
+          title="Switch Azure / Indigo theme" (click)="toggleColorTheme()">
           <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M15 8v8H5a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h10Zm2 2.5 4-2.5v8l-4-2.5v-3Z"/>
+            <path
+              d="M19.4 13a7.8 7.8 0 0 0 .1-1 7.8 7.8 0 0 0-.1-1l2.1-1.6-2-3.4-2.5 1a7.5 7.5 0 0 0-1.7-1L15 3.3h-4L10.6 6a7.5 7.5 0 0 0-1.7 1L6.5 6l-2 3.4L6.6 11a7.8 7.8 0 0 0-.1 1 7.8 7.8 0 0 0 .1 1l-2.1 1.6 2 3.4 2.4-1a7.5 7.5 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.5 7.5 0 0 0 1.7-1l2.4 1 2-3.4L19.4 13ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
           </svg>
         </button>
-
-        <!-- VOICE CALL - UI ready, functionality later -->
-        <button
-          class="header-icon"
-          type="button"
-          aria-label="Voice call"
-          title="Voice call coming later"
-          disabled>
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M6.6 10.8c1.5 3 3.9 5.4 6.9 6.9l2.3-2.3c.3-.3.7-.4 1.1-.2 1.2.4 2.4.6 3.7.6.6 0 1 .4 1 1V21c0 .6-.4 1-1 1C10.3 22 2 13.7 2 3.4c0-.6.4-1 1-1h4.2c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.7.1.4 0 .8-.2 1.1l-2 2.6Z"/>
-          </svg>
-        </button>
-
-        <button class="header-icon menu-button" type="button" aria-label="More options">⋮</button>
       </header>
 
       <main class="chat-body">
-
         @if (!joined()) {
-          <section class="join-card">
-            <div class="join-title">Start conversation</div>
+        <section class="join-card">
+          <div class="join-kicker">VIDEO · SPEAK · UNDERSTAND</div>
+          <h1>Start conversation</h1>
+          <p>Choose your language and join the same conversation ID on both devices.</p>
 
-            <ion-item lines="none" class="join-field">
-              <ion-input
-                label="Session ID"
-                labelPlacement="stacked"
-                placeholder="Enter session ID"
-                [(ngModel)]="sessionId">
-              </ion-input>
-            </ion-item>
+          <ion-item lines="none" class="join-field">
+            <ion-input label="Conversation ID" labelPlacement="stacked" placeholder="Enter conversation ID"
+              [(ngModel)]="sessionId"></ion-input>
+          </ion-item>
 
-            <ion-item lines="none" class="join-field">
-              <ion-select
-                label="My language"
-                labelPlacement="stacked"
-                [(ngModel)]="selectedLanguage"
-                (ionChange)="languageChanged()">
-                @for (language of languages; track language.code) {
-                  <ion-select-option [value]="language.code">
-                    {{ language.name }}
-                  </ion-select-option>
-                }
-              </ion-select>
-            </ion-item>
+          <ion-item lines="none" class="join-field">
+            <ion-select label="My language" labelPlacement="stacked" [(ngModel)]="selectedLanguage"
+              (ionChange)="languageChanged()">
+              @for (language of languages; track language.code) {
+              <ion-select-option [value]="language.code">{{ language.name }}</ion-select-option>
+              }
+            </ion-select>
+          </ion-item>
 
-            <ion-button expand="block" (click)="joinSession()">
-              Join conversation
-            </ion-button>
+          <ion-button class="join-button" expand="block" (click)="joinSession()">Join conversation</ion-button>
 
-            @if (speech.modelInstalling()) {
-              <div class="model-status">
-                Preparing offline speech model: {{ speech.modelInstallProgress() }}%
-              </div>
-            }
-
-            @if (speech.error()) {
-              <div class="model-error">{{ speech.error() }}</div>
-            }
-          </section>
+          @if (speech.modelInstalling()) {
+          <div class="model-status">Preparing offline speech model: {{ speech.modelInstallProgress() }}%</div>
+          }
+          @if (speech.error()) {
+          <div class="model-error">{{ speech.error() }}</div>
+          }
+        </section>
+        } @else {
+        <section class="ready-card">
+          <div class="ready-avatar">L</div>
+          <div class="ready-copy">
+            <strong>Lumian Lingo</strong>
+            <span>{{ remoteLanguage() ? ('Online · ' + remoteLanguage()) : 'Waiting for participant…' }}</span>
+          </div>
+          <button class="start-video-button" type="button" aria-label="Start video call"
+            [disabled]="!speech.modelReady() || !remoteLanguage()" (click)="startCall()">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 8v8H5a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h10Zm2 2.5 4-2.5v8l-4-2.5v-3Z" />
+            </svg>
+          </button>
+        </section>
         }
 
         @if (joined() && subtitleHistory().length === 0 && messages().length === 0) {
-          <div class="empty-chat">
-            <div class="empty-chat-pill">
-              Conversation started · {{ selectedLanguage }} ↔ {{ remoteLanguage() ?? '...' }}
-            </div>
+        <div class="empty-chat">
+          <div class="empty-chat-pill">Conversation started · {{ selectedLanguage }} ↔ {{ remoteLanguage() ?? '...' }}
           </div>
+        </div>
         }
 
-        <!-- Spoken/translated conversation history -->
         @for (item of subtitleHistory(); track item.segmentId) {
-          <div class="message-row translated-row">
-            <div class="message-bubble translated-bubble">
-              <div class="bubble-original">{{ item.originalText }}</div>
-              <div class="bubble-translation">{{ item.translatedText }}</div>
-            </div>
+        <div class="message-row translated-row">
+          <div class="message-bubble translated-bubble">
+            <div class="bubble-original">{{ item.originalText }}</div>
+            <div class="bubble-translation">{{ item.translatedText }}</div>
           </div>
+        </div>
         }
 
-        <!-- Existing typed chat -->
         @for (message of messages(); track $index) {
-          <div
-            class="message-row"
-            [class.message-row-sent]="message.direction === 'sent'">
-            <div
-              class="message-bubble"
-              [class.message-bubble-sent]="message.direction === 'sent'">
-              {{ message.text }}
-            </div>
+        <div class="message-row" [class.message-row-sent]="message.direction === 'sent'">
+          <div class="message-bubble" [class.message-bubble-sent]="message.direction === 'sent'">{{ message.text }}
           </div>
+        </div>
         }
-
       </main>
 
+      @if (joined()) {
       <footer class="composer">
-        <button class="composer-icon" type="button" aria-label="Emoji">☺</button>
-
-        <ion-input
-          class="message-input"
-          aria-label="Message"
-          placeholder="Type a message"
-          [(ngModel)]="messageText"
-          [disabled]="!joined()"
-          (keyup.enter)="send()">
-        </ion-input>
-
-        @if (messageText.trim()) {
-          <button
-            class="send-button"
-            type="button"
-            aria-label="Send"
-            [disabled]="!joined()"
-            (click)="send()">➤</button>
-        } @else {
-          <button class="mic-button" type="button" aria-label="Voice message">●</button>
-        }
+        <ion-input class="message-input" aria-label="Message" placeholder="Type a message" [(ngModel)]="messageText"
+          (keyup.enter)="send()"></ion-input>
+        <button class="send-button" type="button" aria-label="Send" [disabled]="!messageText.trim()"
+          (click)="send()">➤</button>
       </footer>
-
+      }
     </div>
-  }
-
-  <!-- ===================================================== -->
-  <!-- FULLSCREEN VIDEO CALL                                 -->
-  <!-- ===================================================== -->
-  <div class="call-screen" [class.call-screen-active]="webRtc.callConnected()">
-    <video #remoteVideo class="remote-video" autoplay playsinline></video>
-
-    @if (!webRtc.remoteMediaStream()) {
-      <div class="remote-placeholder">
-        <div class="call-avatar">L</div>
-        <div>Connecting...</div>
-      </div>
     }
 
-    <div class="call-top-bar">
-      <div class="call-peer-name">Lumian Lingo</div>
-      <div class="call-language">{{ selectedLanguage }} → {{ remoteLanguage() ?? '...' }}</div>
-    </div>
+    <div class="call-screen" [class.call-screen-active]="webRtc.callConnected()">
+      <header class="call-brand-header">
+        <button class="brand-wave" type="button"
+          aria-label="Lumian"><span></span><span></span><span></span><span></span><span></span></button>
+        <div class="brand-copy">
+          <div class="brand-name">Lumian</div>
+          <div class="brand-subtitle">Lingo Talk</div>
+        </div>
+        <button class="round-icon settings-button" type="button" aria-label="Change color theme"
+          (click)="toggleColorTheme()">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              d="M19.4 13a7.8 7.8 0 0 0 .1-1 7.8 7.8 0 0 0-.1-1l2.1-1.6-2-3.4-2.5 1a7.5 7.5 0 0 0-1.7-1L15 3.3h-4L10.6 6a7.5 7.5 0 0 0-1.7 1L6.5 6l-2 3.4L6.6 11a7.8 7.8 0 0 0-.1 1 7.8 7.8 0 0 0 .1 1l-2.1 1.6 2 3.4 2.4-1a7.5 7.5 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.5 7.5 0 0 0 1.7-1l2.4 1 2-3.4L19.4 13ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
+          </svg>
+        </button>
+      </header>
 
-    <video #localVideo class="local-video" autoplay muted playsinline></video>
+      <div class="video-stage">
+        <video #remoteVideo class="remote-video" autoplay playsinline></video>
+        @if (!webRtc.remoteMediaStream()) {
+        <div class="remote-placeholder">
+          <div class="call-avatar">L</div>
+          <div>Connecting…</div>
+        </div>
+        }
 
-    @if (subtitle(); as currentSubtitle) {
-      <div class="subtitle-overlay">
-        <div class="subtitle-original">{{ currentSubtitle.originalText }}</div>
-        <div class="subtitle-translation">{{ currentSubtitle.translatedText }}</div>
+        <div class="call-language-pill">{{ selectedLanguage }} → {{ remoteLanguage() ?? '...' }}</div>
+        <video #localVideo class="local-video" autoplay muted playsinline></video>
+
+        @if (subtitlesVisible()) {
+        <div class="live-translation-card">
+
+          @if (liveSttText()) {
+          <div class="translation-row stt-row">
+            <span class="translation-label">STT</span>
+
+            <span class="translation-text">
+              {{ liveSttText() }}
+            </span>
+          </div>
+          }
+
+          @if (liveLocalTranslation()) {
+          <div class="translation-row local-row">
+            <span class="translation-label">LOCAL</span>
+
+            <span class="translation-text">
+              {{ liveLocalTranslation() }}
+            </span>
+          </div>
+          }
+
+          @if (liveAiTranslation() || liveAiPending()) {
+          <div class="translation-divider"></div>
+
+          <div class="translation-row ai-row">
+            <span class="translation-label">AI</span>
+
+            <div class="ai-copy">
+
+              @if (
+              liveAiOriginal() &&
+              liveAiOriginal() !== liveSttText()
+              ) {
+              <div class="ai-corrected-original">
+                {{ liveAiOriginal() }}
+              </div>
+              }
+
+              @if (liveAiTranslation()) {
+              <div class="ai-translated">
+                {{ liveAiTranslation() }}
+              </div>
+              } @else {
+              <div class="ai-pending">
+                Translating…
+              </div>
+              }
+
+            </div>
+          </div>
+          }
+
+        </div>
+        }
       </div>
-    }
 
-    @if (historyOpen()) {
+      <div class="primary-call-controls">
+        <button class="call-action" [class.is-off]="!microphoneEnabled()" type="button" (click)="toggleMicrophone()">
+          <span class="control-circle"><svg viewBox="0 0 24 24">
+              <path
+                d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21H8v2h8v-2h-3v-3.08A7 7 0 0 0 19 11h-2Z" />
+            </svg></span>
+          <span>{{ microphoneEnabled() ? 'Mute' : 'Unmute' }}</span>
+        </button>
+
+        <button class="call-action" type="button" (click)="endCall()">
+          <span class="control-circle end-circle"><svg viewBox="0 0 24 24">
+              <path
+                d="M4.6 15.4 2.5 13.3c5.3-5.3 13.7-5.3 19 0l-2.1 2.1-2.2-1.2v-2.1a11.7 11.7 0 0 0-10.4 0v2.1l-2.2 1.2Z" />
+            </svg></span>
+          <span>End</span>
+        </button>
+
+        <button class="call-action" [class.is-off]="!cameraEnabled()" type="button" (click)="toggleCamera()">
+          <span class="control-circle"><svg viewBox="0 0 24 24">
+              <path d="M15 8v8H5a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h10Zm2 2.5 4-2.5v8l-4-2.5v-3Z" />
+            </svg></span>
+          <span>Camera</span>
+        </button>
+      </div>
+
+      <div class="feature-controls">
+        <button class="feature-button feature-primary" type="button" (click)="toggleTranslationMode()">
+          <span class="feature-icon">文A</span><span>Translate</span><small>{{ translationMode === 'premium' ? 'Premium'
+            : 'Free' }}</small>
+        </button>
+        <button class="feature-button" [class.feature-active]="subtitlesVisible()" type="button"
+          (click)="toggleSubtitles()">
+          <span class="feature-icon">▭</span><span>Subtitles</span><small>{{ subtitlesVisible() ? 'On' : 'Off'
+            }}</small>
+        </button>
+        <button class="feature-button" type="button" (click)="toggleHistory()">
+          <span class="feature-icon">☰</span><span>History</span><small>Conversation</small>
+        </button>
+      </div>
+
+      @if (historyOpen()) {
       <div class="history-backdrop" (click)="toggleHistory()"></div>
       <section class="subtitle-history">
-        <div class="history-header">
-          <strong>Conversation</strong>
-          <button type="button" (click)="toggleHistory()">×</button>
-        </div>
-
+        <div class="history-header"><strong>Conversation</strong><button type="button"
+            (click)="toggleHistory()">×</button></div>
         <div class="history-content">
-          @if (subtitleHistory().length === 0) {
-            <div class="history-empty">No subtitles yet.</div>
-          } @else {
-            @for (item of subtitleHistory(); track item.segmentId) {
-              <div class="history-item">
-                <div>{{ item.originalText }}</div>
-                <strong>{{ item.translatedText }}</strong>
-              </div>
-            }
+          @if (subtitleHistory().length === 0) { <div class="history-empty">No subtitles yet.</div> }
+          @else {
+          @for (item of subtitleHistory(); track item.segmentId) {
+          <div class="history-item">
+            <div>{{ item.originalText }}</div><strong>{{ item.translatedText }}</strong>
+          </div>
+          }
           }
         </div>
       </section>
-    }
-
-    <div class="call-controls-overlay">
-      <button class="call-control-button" type="button" aria-label="Chat" (click)="toggleHistory()">💬</button>
-      <button class="call-control-button end-call-button" type="button" aria-label="End call" (click)="endCall()">☎</button>
+      }
     </div>
   </div>
-
 </ion-content>

@@ -38,6 +38,10 @@ import {
 } from '../../../core/services/offline-translation.service';
 
 import {
+  PremiumTranslationService
+} from '../../../core/services/premium-translation.service';
+
+import {
   environment
 } from '../../../../environments/environment';
 
@@ -98,6 +102,25 @@ export class ConversationPageComponent
   private readonly offlineTranslation =
     inject(OfflineTranslationService);
 
+  private readonly premiumTranslation =
+    inject(PremiumTranslationService);
+
+  /*
+   * Translation engine.
+   *
+   * Default is PREMIUM for the current test.
+   * Later the UI/account AccessTier can set
+   * this to 'free' or 'premium'.
+   */
+  translationMode: 'free' | 'premium' =
+    (
+      localStorage.getItem(
+        'lingo-translation-mode'
+      ) === 'free'
+    )
+      ? 'free'
+      : 'premium';
+
   readonly webRtc =
     inject(WebRtcService);
 
@@ -138,6 +161,21 @@ export class ConversationPageComponent
   subtitle =
     signal<SubtitleMessage | null>(null);
 
+  /*
+   * LIVE subtitle pipeline:
+   * - liveSttText: newest Sherpa hypothesis for the current 1-5 word chunk
+   * - liveLocalTranslation: ML Kit translation of that exact hypothesis
+   * - liveAiOriginal/liveAiTranslation: OpenAI result for the last committed chunk
+   *
+   * ML Kit is allowed to revise continuously as Sherpa revises its partial.
+   * OpenAI runs only when a chunk is committed (5 words or pause/final).
+   */
+  readonly liveSttText = signal('');
+  readonly liveLocalTranslation = signal('');
+  readonly liveAiOriginal = signal('');
+  readonly liveAiTranslation = signal('');
+  readonly liveAiPending = signal(false);
+
   messages =
     signal<ConversationMessage[]>([]);
 
@@ -153,6 +191,17 @@ export class ConversationPageComponent
 
   readonly historyOpen =
     signal(false);
+
+  // Call UI state. Audio/video track control stays inside WebRtcService.
+  readonly microphoneEnabled = signal(true);
+  readonly cameraEnabled = signal(true);
+  readonly subtitlesVisible = signal(true);
+
+  readonly colorTheme = signal<'azure' | 'indigo'>(
+    localStorage.getItem('lingo-color-theme') === 'indigo'
+      ? 'indigo'
+      : 'azure'
+  );
 
 
   /*
@@ -179,6 +228,21 @@ export class ConversationPageComponent
    */
   private lastObservedFinal = '';
 
+  /*
+   * Each new Sherpa partial invalidates older ML Kit requests.
+   * If "Where" finishes translating after "Where are", the old
+   * result must never overwrite the newer one.
+   */
+  private liveTranslationRevision = 0;
+
+  // Text that liveLocalTranslation currently belongs to.
+  private liveLocalSourceText = '';
+
+  /*
+   * Prevent the same committed text from starting OpenAI twice.
+   */
+  private lastCommittedChunk = '';
+
 
   /*
    * Subtitle chunking rules.
@@ -196,13 +260,24 @@ export class ConversationPageComponent
    */
   private readonly targetChunkWords = 5;
 
-  private readonly maxChunkWords = 6;
+  private readonly maxChunkWords = 5;
 
-  private readonly pauseMs = 650;
+  private readonly pauseMs = 350;
 
 
   private translationTimer:
     ReturnType<typeof setTimeout> | undefined;
+
+  /*
+   * All translation jobs are serialized.
+   *
+   * This is important for Premium:
+   * chunk 2 must not overtake chunk 1, and
+   * when chunk 2 starts, chunk 1 is already
+   * available in subtitleHistory as context.
+   */
+  private translationQueue:
+    Promise<void> = Promise.resolve();
 
 
   constructor() {
@@ -449,6 +524,22 @@ export class ConversationPageComponent
             subtitle
           );
 
+          // Remote side must show the same 3-line view as the sender.
+          // isFinal=false = fast Sherpa + local/ML Kit result.
+          // isFinal=true  = later OpenAI correction/translation for same segment.
+          if (!subtitle.isFinal) {
+            this.liveSttText.set(subtitle.originalText);
+            this.liveLocalTranslation.set(subtitle.translatedText);
+            this.liveLocalSourceText = subtitle.originalText.trim();
+            this.liveAiOriginal.set('');
+            this.liveAiTranslation.set('');
+            this.liveAiPending.set(true);
+          } else {
+            this.liveAiOriginal.set(subtitle.originalText);
+            this.liveAiTranslation.set(subtitle.translatedText);
+            this.liveAiPending.set(false);
+          }
+
           this.addSubtitleToHistory(
             subtitle
           );
@@ -528,132 +619,55 @@ export class ConversationPageComponent
     }
 
     const words =
-      this.splitWords(
-        fullText
-      );
-
+      this.splitWords(fullText);
 
     /*
-     * Sherpa may revise its hypothesis.
-     *
-     * If it temporarily returns fewer
-     * words than we have already consumed,
-     * do not resend old text.
+     * Sherpa can revise the current hypothesis.
+     * Already committed words belong to older subtitle chunks;
+     * only the uncommitted tail is allowed to change on screen.
      */
-    if (
-      words.length <
-      this.consumedWords
-    ) {
-
-      this.translationLog(
-        'PARTIAL_SHORTER_THAN_CONSUMED',
-        {
-          text:
-            fullText,
-
-          words:
-            words.length,
-
-          consumedWords:
-            this.consumedWords
-        }
-      );
-
+    if (words.length < this.consumedWords) {
       return;
     }
 
-
-    let remaining =
-      words.slice(
-        this.consumedWords
-      );
-
-
-    if (
-      remaining.length === 0
-    ) {
-      return;
-    }
-
-
-    /*
-     * New speech arrived, therefore the
-     * previous pause timer is no longer
-     * valid.
-     */
     this.cancelTranslationTimer();
 
+    let remaining =
+      words.slice(this.consumedWords);
 
     /*
-     * Flush as many complete target chunks
-     * as are currently available.
+     * Commit every complete 5-word chunk.
      *
-     * Usually Sherpa grows gradually:
-     *
-     * 3 words
-     * 5 words -> flush 5
-     *
-     * But Sherpa can also jump:
-     *
-     * 3 words
-     * 7 words
-     *
-     * In that case we flush at most 6.
+     * Before commit, the exact same text is already visible through
+     * liveSttText + liveLocalTranslation.
      */
     while (
       remaining.length >=
       this.targetChunkWords
     ) {
-
-      const chunkSize =
-        Math.min(
-          remaining.length,
-          this.maxChunkWords
-        );
-
       const chunkWords =
         remaining.slice(
           0,
-          chunkSize
+          this.maxChunkWords
         );
 
       const chunk =
         chunkWords.join(' ');
 
-
-      this.translationLog(
-        'WORD_LIMIT_FLUSH',
-        {
-          chunk,
-
-          chunkWords:
-            chunkSize,
-
-          availableWords:
-            remaining.length,
-
-          consumedBefore:
-            this.consumedWords
-        }
-      );
-
-
       /*
-       * Mark these words as consumed BEFORE
-       * starting the async translation.
-       *
-       * That prevents a later Sherpa partial
-       * from scheduling the same words again.
+       * Show/translate the complete chunk immediately.
+       * This also catches the case where Sherpa jumped from
+       * 3 directly to 5+ words in one partial.
        */
+      this.showLiveChunk(chunk);
+
       this.consumedWords +=
-        chunkSize;
+        chunkWords.length;
 
-
-      void this.translateAndPublish(
+      void this.commitChunk(
         chunk,
         false
       );
-
 
       remaining =
         words.slice(
@@ -661,46 +675,171 @@ export class ConversationPageComponent
         );
     }
 
-
     /*
-     * Anything left here is normally
-     * 1-4 words.
+     * 1-4 words are NOT hidden anymore.
      *
-     * If the speaker continues, a new
-     * partial will cancel this timer.
+     * Example:
+     *   "Where"          -> show + ML Kit now
+     *   "Where are"      -> replace + ML Kit now
+     *   "Where are the"  -> replace + ML Kit now
      *
-     * If the speaker pauses, those few
-     * words are translated after 650 ms.
+     * Sherpa is free to correct earlier words because this is one
+     * replaceable live hypothesis, not append-only text.
      */
-    if (
-      remaining.length > 0
-    ) {
+    if (remaining.length > 0) {
+      const liveChunk =
+        remaining
+          .slice(0, this.maxChunkWords)
+          .join(' ');
 
-      this.schedulePauseFlush();
+      this.showLiveChunk(
+        liveChunk
+      );
+
+      /*
+       * If the user stops after 1-4 words, commit exactly what is
+       * already visible after the short pause. ML Kit has already
+       * translated it; this timer is primarily for OpenAI/history.
+       */
+      this.schedulePauseCommit();
     }
   }
 
 
-  private schedulePauseFlush():
+  private showLiveChunk(
+    text: string
+  ): void {
+
+    const cleanText =
+      text.trim();
+
+    if (!cleanText) {
+      return;
+    }
+
+    /*
+     * STT itself is synchronous from the UI's point of view:
+     * display the newest Sherpa hypothesis immediately.
+     */
+    this.liveSttText.set(
+      cleanText
+    );
+
+    // A new STT chunk starts a new visual result. Keep LOCAL independent
+    // and mark AI as pending only after commit.
+    this.liveAiOriginal.set('');
+    this.liveAiTranslation.set('');
+
+    /*
+     * Translate every changed hypothesis locally.
+     * Do not await it here; STT must never wait for translation.
+     */
+    void this.translateLiveLocally(
+      cleanText
+    );
+  }
+
+
+  private async translateLiveLocally(
+    text: string
+  ): Promise<void> {
+
+    const targetLanguage =
+      this.remoteLanguage();
+
+    if (
+      !targetLanguage ||
+      !this.joined()
+    ) {
+      return;
+    }
+
+    const revision =
+      ++this.liveTranslationRevision;
+
+    /*
+     * Until ML Kit returns, keep the newest STT visible and clear
+     * the translation belonging to an older hypothesis.
+     */
+    this.liveLocalTranslation.set('');
+
+    try {
+      let translatedText =
+        text;
+
+      if (
+        this.selectedLanguage !==
+        targetLanguage
+      ) {
+        /*
+         * ML Kit currently exists in the Android native app.
+         * Chrome will still receive committed subtitles through SignalR.
+         */
+        if (
+          !Capacitor.isNativePlatform() ||
+          Capacitor.getPlatform() !==
+          'android'
+        ) {
+          return;
+        }
+
+        const result =
+          await this.offlineTranslation
+            .translate(
+              text,
+              this.selectedLanguage,
+              targetLanguage
+            );
+
+        translatedText =
+          result.translatedText;
+      }
+
+      /*
+       * Race protection:
+       * "Where" may finish after "Where are".
+       * Only the newest request is allowed to update the screen.
+       */
+      if (
+        revision !==
+        this.liveTranslationRevision
+      ) {
+        return;
+      }
+
+      this.liveLocalTranslation.set(
+        translatedText
+      );
+      this.liveLocalSourceText = text.trim();
+
+      this.translationLog(
+        'LIVE_MLKIT',
+        {
+          revision,
+          originalText: text,
+          translatedText
+        }
+      );
+
+    } catch (error) {
+
+      if (
+        revision ===
+        this.liveTranslationRevision
+      ) {
+        console.error(
+          '★★★★★ LIVE ML KIT FAILED ★★★★★',
+          error
+        );
+      }
+    }
+  }
+
+
+  private schedulePauseCommit():
     void {
 
     this.cancelTranslationTimer();
-
-
-    this.translationLog(
-      'PAUSE_TIMER_STARTED',
-      {
-        pauseMs:
-          this.pauseMs,
-
-        consumedWords:
-          this.consumedWords,
-
-        latestPartialText:
-          this.latestPartialText
-      }
-    );
-
 
     this.translationTimer =
       setTimeout(
@@ -709,18 +848,15 @@ export class ConversationPageComponent
           this.translationTimer =
             undefined;
 
-
           const words =
             this.splitWords(
               this.latestPartialText
             );
 
-
           const remaining =
             words.slice(
               this.consumedWords
             );
-
 
           if (
             remaining.length === 0
@@ -728,66 +864,32 @@ export class ConversationPageComponent
             return;
           }
 
-
-          /*
-           * Hard protection:
-           *
-           * even if something unusual
-           * happened, this timer will never
-           * produce more than 6 words.
-           */
           const chunkWords =
             remaining.slice(
               0,
               this.maxChunkWords
             );
 
-
-          const text =
+          const chunk =
             chunkWords.join(' ');
-
-
-          this.translationLog(
-            'PAUSE_FLUSH',
-            {
-              text,
-
-              words:
-                chunkWords.length,
-
-              consumedBefore:
-                this.consumedWords
-            }
-          );
-
 
           this.consumedWords +=
             chunkWords.length;
 
-
-          void this.translateAndPublish(
-            text,
+          /*
+           * Local STT + ML Kit were already shown immediately.
+           * Pause now commits the chunk to OpenAI + SignalR/history.
+           */
+          void this.commitChunk(
+            chunk,
             false
           );
 
-
-          /*
-           * Normally PAUSE_FLUSH handles
-           * 1-4 words.
-           *
-           * If for some reason more words
-           * remain, process the current
-           * complete partial again.
-           */
           const stillRemaining =
             words.length -
             this.consumedWords;
 
-
-          if (
-            stillRemaining > 0
-          ) {
-
+          if (stillRemaining > 0) {
             this.processPartial(
               this.latestPartialText
             );
@@ -800,8 +902,8 @@ export class ConversationPageComponent
 
 
   /*
-   * Flush words that remain when Sherpa
-   * closes the current recognition stream.
+   * Sherpa FINAL can contain a correction or words not seen in the
+   * latest partial. Show those words immediately, then commit them.
    */
   private async flushFinalText(
     finalText: string
@@ -809,110 +911,53 @@ export class ConversationPageComponent
 
     this.cancelTranslationTimer();
 
-
     const words =
       this.splitWords(
         finalText
       );
 
-
-    /*
-     * Everything in FINAL has already been
-     * sent through partial chunks.
-     */
     if (
       words.length <=
       this.consumedWords
     ) {
-
-      this.translationLog(
-        'FINAL_NO_NEW_WORDS',
-        {
-          finalText,
-
-          finalWords:
-            words.length,
-
-          consumedWords:
-            this.consumedWords
-        }
-      );
-
-
       this.resetSherpaSegment();
-
       return;
     }
-
 
     let remaining =
       words.slice(
         this.consumedWords
       );
 
-
     while (
       remaining.length > 0
     ) {
-
-      /*
-       * Final text can theoretically contain
-       * many words not seen in partials.
-       *
-       * Never display more than 6 at once.
-       */
       const chunkWords =
         remaining.slice(
           0,
           this.maxChunkWords
         );
 
-
       remaining =
         remaining.slice(
           chunkWords.length
         );
 
-
-      const text =
+      const chunk =
         chunkWords.join(' ');
 
-
-      const isLast =
-        remaining.length === 0;
-
-
-      this.translationLog(
-        'FINAL_FLUSH',
-        {
-          text,
-
-          words:
-            chunkWords.length,
-
-          isLast,
-
-          consumedBefore:
-            this.consumedWords
-        }
+      this.showLiveChunk(
+        chunk
       );
-
 
       this.consumedWords +=
         chunkWords.length;
 
-
-      /*
-       * Final chunks are deliberately awaited
-       * in order, so their history ordering is
-       * deterministic.
-       */
-      await this.translateAndPublish(
-        text,
-        isLast
+      await this.commitChunk(
+        chunk,
+        remaining.length === 0
       );
     }
-
 
     this.resetSherpaSegment();
   }
@@ -937,19 +982,70 @@ export class ConversationPageComponent
 
   /*
    * =========================================================
-   * TRANSLATION + SUBTITLE PUBLISH
+   * COMMITTED CHUNK
    * =========================================================
+   *
+   * LIVE path:
+   * Sherpa -> UI -> ML Kit
+   *
+   * COMMIT path:
+   * 5 words OR 650 ms pause/final -> OpenAI -> UI + SignalR/history
    */
-
-
-  private async translateAndPublish(
+  private commitChunk(
     originalText: string,
+    isFinal: boolean
+  ): Promise<void> {
+
+    const cleanText =
+      originalText.trim();
+
+    if (!cleanText) {
+      return Promise.resolve();
+    }
+
+    /*
+     * A FINAL immediately after a pause can contain the same text.
+     * Do not start a duplicate OpenAI request.
+     */
+    if (
+      cleanText ===
+      this.lastCommittedChunk
+    ) {
+      return Promise.resolve();
+    }
+
+    this.lastCommittedChunk =
+      cleanText;
+
+    const job =
+      this.translationQueue.then(
+        () =>
+          this.commitChunkNow(
+            cleanText,
+            isFinal
+          )
+      );
+
+    this.translationQueue =
+      job.catch(error => {
+
+        console.error(
+          '★★★★★ COMMITTED TRANSLATION FAILED ★★★★★',
+          error
+        );
+      });
+
+    return job;
+  }
+
+
+  private async commitChunkNow(
+    cleanText: string,
     isFinal: boolean
   ): Promise<void> {
 
     const targetLanguage =
       this.remoteLanguage();
-
 
     if (
       !targetLanguage ||
@@ -958,93 +1054,33 @@ export class ConversationPageComponent
       return;
     }
 
-
-    /*
-     * FREE translation currently runs
-     * natively on Android through ML Kit.
-     *
-     * Chrome receives and displays the
-     * finished subtitle pair.
-     *
-     * Browser speech/translation can be
-     * added later.
-     */
-    if (
-      !Capacitor.isNativePlatform() ||
-      Capacitor.getPlatform() !==
-      'android'
-    ) {
-      return;
-    }
-
-
-    const cleanText =
-      originalText.trim();
-
-
-    if (!cleanText) {
-      return;
-    }
-
-
-    /*
-     * Every delivered chunk gets its own ID.
-     *
-     * We are no longer using one ID for an
-     * entire potentially long Sherpa stream.
-     */
     const segmentId =
       this.createSegmentId();
 
+    /*
+     * Ensure that a committed chunk has a local translation too.
+     * Usually the rolling ML Kit request has already produced it,
+     * but this makes the committed result deterministic.
+     */
+    let localTranslatedText =
+      cleanText;
 
     try {
-
-      const translationStartedAt =
-        performance.now();
-
-
-      this.translationLog(
-        'MLKIT_START',
-        {
-          segmentId,
-
-          text:
-            cleanText,
-
-          words:
-            this.splitWords(
-              cleanText
-            ).length,
-
-          sourceLanguage:
-            this.selectedLanguage,
-
-          targetLanguage,
-
-          isFinal
-        }
-      );
-
-
-      let translatedText:
-        string;
-
-
-      /*
-       * Do not invoke ML Kit if both people
-       * use the same language.
-       */
+      // Do not translate the same text twice. The rolling live ML Kit
+      // result is normally already ready by the time this chunk commits.
       if (
-        this.selectedLanguage ===
-        targetLanguage
+        this.liveLocalSourceText === cleanText &&
+        this.liveLocalTranslation().trim()
       ) {
-
-        translatedText =
-          cleanText;
-
-      } else {
-
-        const result =
+        localTranslatedText = this.liveLocalTranslation().trim();
+      } else if (
+        this.selectedLanguage !==
+        targetLanguage &&
+        Capacitor.isNativePlatform() &&
+        Capacitor.getPlatform() ===
+        'android'
+      ) {
+        const localResult =
           await this.offlineTranslation
             .translate(
               cleanText,
@@ -1052,115 +1088,227 @@ export class ConversationPageComponent
               targetLanguage
             );
 
-
-        translatedText =
-          result.translatedText;
+        localTranslatedText =
+          localResult.translatedText;
       }
 
-
-      const mlKitMs =
-        Math.round(
-          performance.now() -
-          translationStartedAt
+      /*
+       * Do not overwrite a newer rolling chunk's translation.
+       * We only force the local value when the committed text is
+       * still the text currently visible.
+       */
+      if (
+        this.liveSttText().trim() ===
+        cleanText
+      ) {
+        this.liveLocalTranslation.set(
+          localTranslatedText
         );
+      }
 
+    } catch (error) {
 
-      this.translationLog(
-        'MLKIT_DONE',
+      console.error(
+        '★★★★★ COMMITTED ML KIT FAILED ★★★★★',
+        error
+      );
+    }
+
+    /*
+     * Publish the fast/local pair immediately.
+     *
+     * Existing SignalR protocol understands this pair already,
+     * so the remote side does not have to wait for OpenAI.
+     */
+    const fastSubtitle:
+      SubtitleMessage = {
+
+      segmentId,
+
+      originalText:
+        cleanText,
+
+      translatedText:
+        localTranslatedText,
+
+      sourceLanguage:
+        this.selectedLanguage,
+
+      targetLanguage,
+
+      isFinal: false
+    };
+
+    this.subtitle.set(
+      fastSubtitle
+    );
+
+    try {
+      await this.signalR.sendSubtitle(
+        this.sessionId.trim(),
+        fastSubtitle
+      );
+    } catch (error) {
+      console.error(
+        '★★★★★ FAST SUBTITLE SIGNALR FAILED ★★★★★',
+        error
+      );
+    }
+
+    /*
+     * FREE mode stops here.
+     * PREMIUM mode additionally produces the OpenAI line below.
+     */
+    if (
+      this.translationMode !==
+      'premium'
+    ) {
+      this.addSubtitleToHistory(
         {
-          segmentId,
-
-          originalText:
-            cleanText,
-
-          translatedText,
-
-          words:
-            this.splitWords(
-              cleanText
-            ).length,
-
-          mlKitMs,
-
+          ...fastSubtitle,
           isFinal
         }
       );
 
+      return;
+    }
 
-      const subtitle:
+    this.liveAiPending.set(true);
+
+    try {
+      const context =
+        this.subtitleHistory()
+          .slice(-3)
+          .map(item => ({
+            originalText:
+              item.originalText,
+
+            translatedText:
+              item.translatedText
+          }));
+
+      const result =
+        await this.premiumTranslation
+          .translate(
+            cleanText,
+            this.selectedLanguage,
+            targetLanguage,
+            context
+          );
+
+      /*
+       * IMPORTANT:
+       * We intentionally keep BOTH translations:
+       *
+       * liveLocalTranslation = ML Kit
+       * liveAiTranslation    = OpenAI
+       */
+      this.liveAiOriginal.set(
+        result.correctedOriginalText
+      );
+
+      this.liveAiTranslation.set(
+        result.translatedText
+      );
+
+      const aiSubtitle:
         SubtitleMessage = {
 
+        /*
+         * Same segmentId: this is the final AI version of the
+         * already delivered fast/local segment.
+         */
         segmentId,
 
         originalText:
-          cleanText,
+          result.correctedOriginalText,
 
-        translatedText,
+        translatedText:
+          result.translatedText,
 
         sourceLanguage:
           this.selectedLanguage,
 
         targetLanguage,
 
-        isFinal
+        isFinal: true
       };
 
+      this.subtitle.set(
+        aiSubtitle
+      );
 
       /*
-       * Sender sees exactly the same original
-       * + translation pair as the receiver.
+       * With the CURRENT protocol the remote side receives this as
+       * the final version of the same segment. The sender can show
+       * ML Kit + OpenAI simultaneously through the live signals.
        */
-      this.translationLog(
-        'LOCAL_SUBTITLE',
-        {
-          segmentId,
-
-          originalText:
-            subtitle.originalText,
-
-          translatedText:
-            subtitle.translatedText,
-
-          isFinal
-        }
-      );
-
-
-      this.subtitle.set(
-        subtitle
-      );
-
-
       await this.signalR.sendSubtitle(
         this.sessionId.trim(),
-        subtitle
+        aiSubtitle
       );
 
-
-      /*
-       * Store a completed delivered subtitle
-       * in local transcript history.
-       */
       this.addSubtitleToHistory(
-        subtitle
+        aiSubtitle
       );
-
 
       this.translationLog(
-        'SIGNALR_SENT',
+        'OPENAI_DONE',
         {
           segmentId,
-          isFinal
+          rawSttText:
+            cleanText,
+          correctedOriginalText:
+            result.correctedOriginalText,
+          localTranslatedText,
+          aiTranslatedText:
+            result.translatedText
         }
       );
 
     } catch (error) {
 
+      /*
+       * OpenAI failure must never remove the already visible
+       * Sherpa + ML Kit result.
+       */
       console.error(
-        '★★★★★ ML KIT TRANSLATION FAILED ★★★★★',
+        '★★★★★ OPENAI TRANSLATION FAILED ★★★★★',
         error
       );
+
+      this.addSubtitleToHistory(
+        {
+          ...fastSubtitle,
+          isFinal
+        }
+      );
+
+    } finally {
+
+      this.liveAiPending.set(false);
     }
+  }
+
+
+  setTranslationMode(
+    mode: 'free' | 'premium'
+  ): void {
+
+    this.translationMode =
+      mode;
+
+    localStorage.setItem(
+      'lingo-translation-mode',
+      mode
+    );
+
+    this.translationLog(
+      'TRANSLATION_MODE_CHANGED',
+      {
+        mode
+      }
+    );
   }
 
 
@@ -1226,6 +1374,21 @@ export class ConversationPageComponent
     this.consumedWords = 0;
 
     this.latestPartialText = '';
+
+    /*
+     * Invalidate any ML Kit request that still belongs to the
+     * previous live hypothesis.
+     */
+    this.liveTranslationRevision++;
+
+    this.liveSttText.set('');
+    this.liveLocalTranslation.set('');
+    this.liveLocalSourceText = '';
+
+    /*
+     * Allow the same phrase to be spoken again in a new Sherpa stream.
+     */
+    this.lastCommittedChunk = '';
 
     this.segmentCounter++;
 
@@ -1398,6 +1561,39 @@ export class ConversationPageComponent
   }
 
 
+  toggleMicrophone(): void {
+    const enabled = !this.microphoneEnabled();
+    this.microphoneEnabled.set(enabled);
+    this.webRtc.setMicrophoneEnabled(enabled);
+  }
+
+
+  toggleCamera(): void {
+    const enabled = !this.cameraEnabled();
+    this.cameraEnabled.set(enabled);
+    this.webRtc.setCameraEnabled(enabled);
+  }
+
+
+  toggleSubtitles(): void {
+    this.subtitlesVisible.update(visible => !visible);
+  }
+
+
+  toggleColorTheme(): void {
+    const next = this.colorTheme() === 'azure' ? 'indigo' : 'azure';
+    this.colorTheme.set(next);
+    localStorage.setItem('lingo-color-theme', next);
+  }
+
+
+  toggleTranslationMode(): void {
+    this.setTranslationMode(
+      this.translationMode === 'premium' ? 'free' : 'premium'
+    );
+  }
+
+
   /*
    * =========================================================
    * CALL
@@ -1423,6 +1619,10 @@ export class ConversationPageComponent
     this.subtitle.set(
       null
     );
+
+    this.microphoneEnabled.set(true);
+    this.cameraEnabled.set(true);
+    this.subtitlesVisible.set(true);
 
 
     await this.webRtc
