@@ -1,261 +1,210 @@
-<ion-header>
-  <ion-toolbar>
-    <ion-title>
-      Lumian Lingo Talk
-    </ion-title>
-  </ion-toolbar>
-</ion-header>
+<ion-content [fullscreen]="true" class="conversation-content">
 
+  @if (!webRtc.callConnected()) {
+    <div class="chat-screen">
 
-<ion-content class="ion-padding">
+      <header class="chat-header">
+        <button class="header-icon back-button" type="button" aria-label="Back">‹</button>
 
-  <ion-item>
+        <div class="contact-avatar">L</div>
 
-    <ion-input label="Session" labelPlacement="stacked" placeholder="Session ID" [(ngModel)]="sessionId">
-    </ion-input>
-
-  </ion-item>
-
-
-  <ion-item>
-
-    <ion-select label="My spoken language" labelPlacement="stacked" [(ngModel)]="selectedLanguage"
-      (ionChange)="languageChanged()">
-
-      @for (
-      language of languages;
-      track language.code
-      ) {
-
-      <ion-select-option [value]="language.code">
-
-        {{ language.name }}
-
-      </ion-select-option>
-
-      }
-
-    </ion-select>
-
-  </ion-item>
-
-
-  <ion-button expand="block" [disabled]="joined()" (click)="joinSession()">
-
-    {{
-    joined()
-    ? 'Connected'
-    : 'Join conversation'
-    }}
-
-  </ion-button>
-
-
-  @if (joined()) {
-
-  <div class="language-status">
-
-    My language:
-    <strong>
-      {{ selectedLanguage }}
-    </strong>
-
-    · Other:
-    <strong>
-      {{ remoteLanguage() ?? 'waiting...' }}
-    </strong>
-
-  </div>
-
-  }
-
-
-  <div class="video-container">
-
-    <div class="remote-video-container">
-
-      <video #remoteVideo class="remote-video" autoplay playsinline>
-      </video>
-
-
-      @if (!webRtc.remoteMediaStream()) {
-
-      <div class="video-placeholder">
-
-        Waiting for other user...
-
-      </div>
-
-      }
-
-
-      @if (subtitle(); as currentSubtitle) {
-
-      <div class="subtitle-overlay">
-
-        <div class="subtitle-original">
-
-          {{
-          currentSubtitle.originalText
-          }}
-
+        <div class="contact-info">
+          <div class="contact-name">Lumian Lingo</div>
+          <div class="contact-status">
+            @if (joined()) {
+              {{ remoteLanguage() ? ('Online · ' + remoteLanguage()) : 'Waiting for participant...' }}
+            } @else {
+              Offline
+            }
+          </div>
         </div>
 
-        <div class="subtitle-translation">
+        <!-- VIDEO CALL -->
+        <button
+          class="header-icon"
+          type="button"
+          aria-label="Video call"
+          [disabled]="!joined() || !speech.modelReady()"
+          (click)="startCall()">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M15 8v8H5a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h10Zm2 2.5 4-2.5v8l-4-2.5v-3Z"/>
+          </svg>
+        </button>
 
-          {{
-          currentSubtitle.translatedText
-          }}
+        <!-- VOICE CALL - UI ready, functionality later -->
+        <button
+          class="header-icon"
+          type="button"
+          aria-label="Voice call"
+          title="Voice call coming later"
+          disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6.6 10.8c1.5 3 3.9 5.4 6.9 6.9l2.3-2.3c.3-.3.7-.4 1.1-.2 1.2.4 2.4.6 3.7.6.6 0 1 .4 1 1V21c0 .6-.4 1-1 1C10.3 22 2 13.7 2 3.4c0-.6.4-1 1-1h4.2c.6 0 1 .4 1 1 0 1.3.2 2.5.6 3.7.1.4 0 .8-.2 1.1l-2 2.6Z"/>
+          </svg>
+        </button>
 
-        </div>
+        <button class="header-icon menu-button" type="button" aria-label="More options">⋮</button>
+      </header>
 
-      </div>
+      <main class="chat-body">
 
-      }
+        @if (!joined()) {
+          <section class="join-card">
+            <div class="join-title">Start conversation</div>
+
+            <ion-item lines="none" class="join-field">
+              <ion-input
+                label="Session ID"
+                labelPlacement="stacked"
+                placeholder="Enter session ID"
+                [(ngModel)]="sessionId">
+              </ion-input>
+            </ion-item>
+
+            <ion-item lines="none" class="join-field">
+              <ion-select
+                label="My language"
+                labelPlacement="stacked"
+                [(ngModel)]="selectedLanguage"
+                (ionChange)="languageChanged()">
+                @for (language of languages; track language.code) {
+                  <ion-select-option [value]="language.code">
+                    {{ language.name }}
+                  </ion-select-option>
+                }
+              </ion-select>
+            </ion-item>
+
+            <ion-button expand="block" (click)="joinSession()">
+              Join conversation
+            </ion-button>
+
+            @if (speech.modelInstalling()) {
+              <div class="model-status">
+                Preparing offline speech model: {{ speech.modelInstallProgress() }}%
+              </div>
+            }
+
+            @if (speech.error()) {
+              <div class="model-error">{{ speech.error() }}</div>
+            }
+          </section>
+        }
+
+        @if (joined() && subtitleHistory().length === 0 && messages().length === 0) {
+          <div class="empty-chat">
+            <div class="empty-chat-pill">
+              Conversation started · {{ selectedLanguage }} ↔ {{ remoteLanguage() ?? '...' }}
+            </div>
+          </div>
+        }
+
+        <!-- Spoken/translated conversation history -->
+        @for (item of subtitleHistory(); track item.segmentId) {
+          <div class="message-row translated-row">
+            <div class="message-bubble translated-bubble">
+              <div class="bubble-original">{{ item.originalText }}</div>
+              <div class="bubble-translation">{{ item.translatedText }}</div>
+            </div>
+          </div>
+        }
+
+        <!-- Existing typed chat -->
+        @for (message of messages(); track $index) {
+          <div
+            class="message-row"
+            [class.message-row-sent]="message.direction === 'sent'">
+            <div
+              class="message-bubble"
+              [class.message-bubble-sent]="message.direction === 'sent'">
+              {{ message.text }}
+            </div>
+          </div>
+        }
+
+      </main>
+
+      <footer class="composer">
+        <button class="composer-icon" type="button" aria-label="Emoji">☺</button>
+
+        <ion-input
+          class="message-input"
+          aria-label="Message"
+          placeholder="Type a message"
+          [(ngModel)]="messageText"
+          [disabled]="!joined()"
+          (keyup.enter)="send()">
+        </ion-input>
+
+        @if (messageText.trim()) {
+          <button
+            class="send-button"
+            type="button"
+            aria-label="Send"
+            [disabled]="!joined()"
+            (click)="send()">➤</button>
+        } @else {
+          <button class="mic-button" type="button" aria-label="Voice message">●</button>
+        }
+      </footer>
 
     </div>
-
-
-    <video #localVideo class="local-video" autoplay muted playsinline>
-    </video>
-
-  </div>
-
-
-  <div class="call-controls">
-
-    <ion-button [disabled]="
-        !joined() ||
-        !speech.modelReady()
-      " (click)="startCall()">
-
-      Start call
-
-    </ion-button>
-
-
-    <ion-button [disabled]="
-        webRtc.callState() === 'closed'
-      " (click)="endCall()">
-
-      End call
-
-    </ion-button>
-
-  </div>
-
-
-  <div>
-    Call state:
-    {{ webRtc.callState() }}
-  </div>
-
-
-  <div>
-    STT state:
-    {{ speech.state() }}
-    · engine:
-    {{ speech.engine() }}
-    · language:
-    {{ speech.language() }}
-  </div>
-
-
-  @if (speech.modelInstalling()) {
-
-  <div>
-
-    Installing offline speech model:
-    {{ speech.modelInstallProgress() }}%
-
-  </div>
-
   }
 
+  <!-- ===================================================== -->
+  <!-- FULLSCREEN VIDEO CALL                                 -->
+  <!-- ===================================================== -->
+  <div class="call-screen" [class.call-screen-active]="webRtc.callConnected()">
+    <video #remoteVideo class="remote-video" autoplay playsinline></video>
 
-  @if (speech.modelReady()) {
-
-  <div>
-    Offline speech model: Ready
-  </div>
-
-  }
-
-
-  <div>
-    Partial:
-    {{ speech.partialText() }}
-  </div>
-
-
-  <div>
-    Final:
-    {{ speech.finalText() }}
-  </div>
-
-
-  @if (speech.error()) {
-
-  <div>
-
-    STT error:
-    {{ speech.error() }}
-
-  </div>
-
-  }
-
-
-  <ion-list>
-
-    @for (
-    message of messages();
-    track $index
-    ) {
-
-    <ion-item>
-
-      <ion-label>
-
-        <strong>
-
-          {{
-          message.direction === 'sent'
-          ? 'You'
-          : 'Other'
-          }}
-
-        </strong>
-
-        <div>
-          {{ message.text }}
-        </div>
-
-      </ion-label>
-
-    </ion-item>
-
+    @if (!webRtc.remoteMediaStream()) {
+      <div class="remote-placeholder">
+        <div class="call-avatar">L</div>
+        <div>Connecting...</div>
+      </div>
     }
 
-  </ion-list>
+    <div class="call-top-bar">
+      <div class="call-peer-name">Lumian Lingo</div>
+      <div class="call-language">{{ selectedLanguage }} → {{ remoteLanguage() ?? '...' }}</div>
+    </div>
 
+    <video #localVideo class="local-video" autoplay muted playsinline></video>
 
-  <ion-item>
+    @if (subtitle(); as currentSubtitle) {
+      <div class="subtitle-overlay">
+        <div class="subtitle-original">{{ currentSubtitle.originalText }}</div>
+        <div class="subtitle-translation">{{ currentSubtitle.translatedText }}</div>
+      </div>
+    }
 
-    <ion-input label="Message" labelPlacement="stacked" placeholder="Write a message..." [(ngModel)]="messageText"
-      (keyup.enter)="send()">
-    </ion-input>
+    @if (historyOpen()) {
+      <div class="history-backdrop" (click)="toggleHistory()"></div>
+      <section class="subtitle-history">
+        <div class="history-header">
+          <strong>Conversation</strong>
+          <button type="button" (click)="toggleHistory()">×</button>
+        </div>
 
-  </ion-item>
+        <div class="history-content">
+          @if (subtitleHistory().length === 0) {
+            <div class="history-empty">No subtitles yet.</div>
+          } @else {
+            @for (item of subtitleHistory(); track item.segmentId) {
+              <div class="history-item">
+                <div>{{ item.originalText }}</div>
+                <strong>{{ item.translatedText }}</strong>
+              </div>
+            }
+          }
+        </div>
+      </section>
+    }
 
-
-  <ion-button expand="block" [disabled]="
-      !joined() ||
-      !messageText.trim()
-    " (click)="send()">
-
-    Send
-
-  </ion-button>
+    <div class="call-controls-overlay">
+      <button class="call-control-button" type="button" aria-label="Chat" (click)="toggleHistory()">💬</button>
+      <button class="call-control-button end-call-button" type="button" aria-label="End call" (click)="endCall()">☎</button>
+    </div>
+  </div>
 
 </ion-content>

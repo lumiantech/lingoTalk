@@ -1,3 +1,4 @@
+
 import { CommonModule } from '@angular/common';
 import {
   Component,
@@ -141,21 +142,67 @@ export class ConversationPageComponent
     signal<ConversationMessage[]>([]);
 
 
+  /*
+   * Subtitle transcript/history.
+   *
+   * This is intentionally separate from
+   * manual text chat.
+   */
+  readonly subtitleHistory =
+    signal<SubtitleMessage[]>([]);
+
+  readonly historyOpen =
+    signal(false);
+
+
+  /*
+   * Sherpa stream/chunk state.
+   */
   private segmentCounter = 0;
 
-  private activeSegmentId =
-    this.createSegmentId();
+  /*
+   * Number of words from the current
+   * Sherpa stream that have already been
+   * consumed by subtitle chunks.
+   */
+  private consumedWords = 0;
+
+  /*
+   * Latest complete partial returned by
+   * Sherpa for the current stream.
+   */
+  private latestPartialText = '';
+
+  /*
+   * Used to prevent processing the same
+   * FINAL signal twice.
+   */
+  private lastObservedFinal = '';
+
+
+  /*
+   * Subtitle chunking rules.
+   *
+   * 5 words:
+   * preferred immediate subtitle size.
+   *
+   * 6 words:
+   * absolute maximum when Sherpa jumps
+   * over the 5-word boundary.
+   *
+   * 650 ms:
+   * if the speaker pauses with only
+   * 1-4 pending words, translate them too.
+   */
+  private readonly targetChunkWords = 5;
+
+  private readonly maxChunkWords = 6;
+
+  private readonly pauseMs = 650;
+
 
   private translationTimer:
     ReturnType<typeof setTimeout> | undefined;
-
-  private translationVersion = 0;
-
-  private lastScheduledText = '';
-
-  private lastTranslatedText = '';
-
-  private lastObservedFinal = '';
 
 
   constructor() {
@@ -200,34 +247,62 @@ export class ConversationPageComponent
     /*
      * Observe Sherpa partials.
      *
-     * Do not translate every 100 ms PCM chunk.
-     * Wait briefly for a more stable partial.
+     * We no longer translate the whole
+     * growing Sherpa sentence.
+     *
+     * Instead we keep track of words that
+     * have already been consumed.
+     *
+     * Rules:
+     *
+     * 1-4 new words:
+     * wait for more speech, but only for
+     * at most 650 ms.
+     *
+     * 5 new words:
+     * translate immediately.
+     *
+     * 6+ new words:
+     * translate immediately and never put
+     * more than 6 words into one chunk.
      */
     effect(() => {
 
       const partial =
         this.speech.partialText().trim();
 
+      this.translationLog(
+        'STT_PARTIAL',
+        {
+          text: partial,
+
+          words: partial
+            ? this.splitWords(partial).length
+            : 0,
+
+          consumedWords:
+            this.consumedWords
+        }
+      );
+
       if (!partial) {
         return;
       }
 
-      if (partial === this.lastScheduledText) {
-        return;
-      }
+      this.latestPartialText =
+        partial;
 
-      this.lastScheduledText = partial;
-
-      this.scheduleTranslation(
-        partial,
-        false
+      this.processPartial(
+        partial
       );
     });
 
 
     /*
-     * Final Sherpa result is translated
-     * immediately and closes the segment.
+     * Sherpa FINAL.
+     *
+     * Only words that were NOT already
+     * translated are flushed here.
      */
     effect(() => {
 
@@ -250,9 +325,24 @@ export class ConversationPageComponent
 
       this.cancelTranslationTimer();
 
-      void this.translateAndPublish(
-        finalText,
-        true
+      this.translationLog(
+        'STT_FINAL',
+        {
+          text:
+            finalText,
+
+          words:
+            this.splitWords(
+              finalText
+            ).length,
+
+          consumedWords:
+            this.consumedWords
+        }
+      );
+
+      void this.flushFinalText(
+        finalText
       );
     });
   }
@@ -265,6 +355,14 @@ export class ConversationPageComponent
       'lingo-language',
       this.selectedLanguage
     );
+
+    /*
+     * A language change starts a clean
+     * speech/chunk stream.
+     */
+    this.resetSherpaSegment();
+
+    this.lastObservedFinal = '';
 
     if (this.joined()) {
 
@@ -283,7 +381,8 @@ export class ConversationPageComponent
   }
 
 
-  async connect(): Promise<void> {
+  async connect():
+    Promise<void> {
 
     await this.signalR.connect(
       environment.apiBaseUrl
@@ -311,28 +410,55 @@ export class ConversationPageComponent
       .onParticipantLeft(
         () => {
 
-          this.remoteLanguage.set(null);
+          this.remoteLanguage.set(
+            null
+          );
         }
       );
 
 
+    /*
+     * Subtitle produced by the other
+     * participant.
+     *
+     * Display it and put exactly the same
+     * pair into local subtitle history.
+     */
     this.signalR
       .onSubtitleReceived(
         subtitle => {
 
-          console.log(
-            '★★★★★ SUBTITLE RECEIVED',
-            subtitle,
-            '★★★★★'
+          this.translationLog(
+            'SIGNALR_RECEIVED',
+            {
+              segmentId:
+                subtitle.segmentId,
+
+              originalText:
+                subtitle.originalText,
+
+              translatedText:
+                subtitle.translatedText,
+
+              isFinal:
+                subtitle.isFinal
+            }
           );
 
           this.subtitle.set(
+            subtitle
+          );
+
+          this.addSubtitleToHistory(
             subtitle
           );
         }
       );
 
 
+    /*
+     * Existing manual text chat.
+     */
     this.signalR.onTextReceived(
       (text: string) => {
 
@@ -351,7 +477,9 @@ export class ConversationPageComponent
 
     this.registerWebRtcSignaling();
 
-    this.connected.set(true);
+    this.connected.set(
+      true
+    );
   }
 
 
@@ -366,6 +494,7 @@ export class ConversationPageComponent
     }
 
     if (!this.connected()) {
+
       await this.connect();
     }
 
@@ -374,13 +503,21 @@ export class ConversationPageComponent
       this.selectedLanguage
     );
 
-    this.joined.set(true);
+    this.joined.set(
+      true
+    );
   }
 
 
-  private scheduleTranslation(
-    text: string,
-    isFinal: boolean
+  /*
+   * =========================================================
+   * SUBTITLE CHUNKING
+   * =========================================================
+   */
+
+
+  private processPartial(
+    fullText: string
   ): void {
 
     if (
@@ -390,20 +527,419 @@ export class ConversationPageComponent
       return;
     }
 
+    const words =
+      this.splitWords(
+        fullText
+      );
+
+
+    /*
+     * Sherpa may revise its hypothesis.
+     *
+     * If it temporarily returns fewer
+     * words than we have already consumed,
+     * do not resend old text.
+     */
+    if (
+      words.length <
+      this.consumedWords
+    ) {
+
+      this.translationLog(
+        'PARTIAL_SHORTER_THAN_CONSUMED',
+        {
+          text:
+            fullText,
+
+          words:
+            words.length,
+
+          consumedWords:
+            this.consumedWords
+        }
+      );
+
+      return;
+    }
+
+
+    let remaining =
+      words.slice(
+        this.consumedWords
+      );
+
+
+    if (
+      remaining.length === 0
+    ) {
+      return;
+    }
+
+
+    /*
+     * New speech arrived, therefore the
+     * previous pause timer is no longer
+     * valid.
+     */
     this.cancelTranslationTimer();
+
+
+    /*
+     * Flush as many complete target chunks
+     * as are currently available.
+     *
+     * Usually Sherpa grows gradually:
+     *
+     * 3 words
+     * 5 words -> flush 5
+     *
+     * But Sherpa can also jump:
+     *
+     * 3 words
+     * 7 words
+     *
+     * In that case we flush at most 6.
+     */
+    while (
+      remaining.length >=
+      this.targetChunkWords
+    ) {
+
+      const chunkSize =
+        Math.min(
+          remaining.length,
+          this.maxChunkWords
+        );
+
+      const chunkWords =
+        remaining.slice(
+          0,
+          chunkSize
+        );
+
+      const chunk =
+        chunkWords.join(' ');
+
+
+      this.translationLog(
+        'WORD_LIMIT_FLUSH',
+        {
+          chunk,
+
+          chunkWords:
+            chunkSize,
+
+          availableWords:
+            remaining.length,
+
+          consumedBefore:
+            this.consumedWords
+        }
+      );
+
+
+      /*
+       * Mark these words as consumed BEFORE
+       * starting the async translation.
+       *
+       * That prevents a later Sherpa partial
+       * from scheduling the same words again.
+       */
+      this.consumedWords +=
+        chunkSize;
+
+
+      void this.translateAndPublish(
+        chunk,
+        false
+      );
+
+
+      remaining =
+        words.slice(
+          this.consumedWords
+        );
+    }
+
+
+    /*
+     * Anything left here is normally
+     * 1-4 words.
+     *
+     * If the speaker continues, a new
+     * partial will cancel this timer.
+     *
+     * If the speaker pauses, those few
+     * words are translated after 650 ms.
+     */
+    if (
+      remaining.length > 0
+    ) {
+
+      this.schedulePauseFlush();
+    }
+  }
+
+
+  private schedulePauseFlush():
+    void {
+
+    this.cancelTranslationTimer();
+
+
+    this.translationLog(
+      'PAUSE_TIMER_STARTED',
+      {
+        pauseMs:
+          this.pauseMs,
+
+        consumedWords:
+          this.consumedWords,
+
+        latestPartialText:
+          this.latestPartialText
+      }
+    );
+
 
     this.translationTimer =
       setTimeout(
         () => {
 
+          this.translationTimer =
+            undefined;
+
+
+          const words =
+            this.splitWords(
+              this.latestPartialText
+            );
+
+
+          const remaining =
+            words.slice(
+              this.consumedWords
+            );
+
+
+          if (
+            remaining.length === 0
+          ) {
+            return;
+          }
+
+
+          /*
+           * Hard protection:
+           *
+           * even if something unusual
+           * happened, this timer will never
+           * produce more than 6 words.
+           */
+          const chunkWords =
+            remaining.slice(
+              0,
+              this.maxChunkWords
+            );
+
+
+          const text =
+            chunkWords.join(' ');
+
+
+          this.translationLog(
+            'PAUSE_FLUSH',
+            {
+              text,
+
+              words:
+                chunkWords.length,
+
+              consumedBefore:
+                this.consumedWords
+            }
+          );
+
+
+          this.consumedWords +=
+            chunkWords.length;
+
+
           void this.translateAndPublish(
             text,
-            isFinal
+            false
           );
+
+
+          /*
+           * Normally PAUSE_FLUSH handles
+           * 1-4 words.
+           *
+           * If for some reason more words
+           * remain, process the current
+           * complete partial again.
+           */
+          const stillRemaining =
+            words.length -
+            this.consumedWords;
+
+
+          if (
+            stillRemaining > 0
+          ) {
+
+            this.processPartial(
+              this.latestPartialText
+            );
+          }
+
         },
-        750
+        this.pauseMs
       );
   }
+
+
+  /*
+   * Flush words that remain when Sherpa
+   * closes the current recognition stream.
+   */
+  private async flushFinalText(
+    finalText: string
+  ): Promise<void> {
+
+    this.cancelTranslationTimer();
+
+
+    const words =
+      this.splitWords(
+        finalText
+      );
+
+
+    /*
+     * Everything in FINAL has already been
+     * sent through partial chunks.
+     */
+    if (
+      words.length <=
+      this.consumedWords
+    ) {
+
+      this.translationLog(
+        'FINAL_NO_NEW_WORDS',
+        {
+          finalText,
+
+          finalWords:
+            words.length,
+
+          consumedWords:
+            this.consumedWords
+        }
+      );
+
+
+      this.resetSherpaSegment();
+
+      return;
+    }
+
+
+    let remaining =
+      words.slice(
+        this.consumedWords
+      );
+
+
+    while (
+      remaining.length > 0
+    ) {
+
+      /*
+       * Final text can theoretically contain
+       * many words not seen in partials.
+       *
+       * Never display more than 6 at once.
+       */
+      const chunkWords =
+        remaining.slice(
+          0,
+          this.maxChunkWords
+        );
+
+
+      remaining =
+        remaining.slice(
+          chunkWords.length
+        );
+
+
+      const text =
+        chunkWords.join(' ');
+
+
+      const isLast =
+        remaining.length === 0;
+
+
+      this.translationLog(
+        'FINAL_FLUSH',
+        {
+          text,
+
+          words:
+            chunkWords.length,
+
+          isLast,
+
+          consumedBefore:
+            this.consumedWords
+        }
+      );
+
+
+      this.consumedWords +=
+        chunkWords.length;
+
+
+      /*
+       * Final chunks are deliberately awaited
+       * in order, so their history ordering is
+       * deterministic.
+       */
+      await this.translateAndPublish(
+        text,
+        isLast
+      );
+    }
+
+
+    this.resetSherpaSegment();
+  }
+
+
+  private splitWords(
+    text: string
+  ): string[] {
+
+    const clean =
+      text.trim();
+
+    if (!clean) {
+      return [];
+    }
+
+    return clean.split(
+      /\s+/
+    );
+  }
+
+
+  /*
+   * =========================================================
+   * TRANSLATION + SUBTITLE PUBLISH
+   * =========================================================
+   */
 
 
   private async translateAndPublish(
@@ -414,6 +950,7 @@ export class ConversationPageComponent
     const targetLanguage =
       this.remoteLanguage();
 
+
     if (
       !targetLanguage ||
       !this.joined()
@@ -421,66 +958,133 @@ export class ConversationPageComponent
       return;
     }
 
+
     /*
-     * For now FREE translation is Android
-     * ML Kit only.
+     * FREE translation currently runs
+     * natively on Android through ML Kit.
      *
-     * Chrome can receive subtitles, but does
-     * not create translations yet.
+     * Chrome receives and displays the
+     * finished subtitle pair.
+     *
+     * Browser speech/translation can be
+     * added later.
      */
     if (
       !Capacitor.isNativePlatform() ||
       Capacitor.getPlatform() !==
-        'android'
+      'android'
     ) {
       return;
     }
 
+
     const cleanText =
       originalText.trim();
+
 
     if (!cleanText) {
       return;
     }
 
-    if (
-      !isFinal &&
-      cleanText === this.lastTranslatedText
-    ) {
-      return;
-    }
 
-
-    const version =
-      ++this.translationVersion;
-
+    /*
+     * Every delivered chunk gets its own ID.
+     *
+     * We are no longer using one ID for an
+     * entire potentially long Sherpa stream.
+     */
     const segmentId =
-      this.activeSegmentId;
+      this.createSegmentId();
 
 
     try {
 
-      const result =
-        await this.offlineTranslation
-          .translate(
+      const translationStartedAt =
+        performance.now();
+
+
+      this.translationLog(
+        'MLKIT_START',
+        {
+          segmentId,
+
+          text:
             cleanText,
+
+          words:
+            this.splitWords(
+              cleanText
+            ).length,
+
+          sourceLanguage:
             this.selectedLanguage,
-            targetLanguage
-          );
+
+          targetLanguage,
+
+          isFinal
+        }
+      );
+
+
+      let translatedText:
+        string;
 
 
       /*
-       * A newer partial may already have been
-       * requested while ML Kit was translating.
-       * Ignore the stale result.
+       * Do not invoke ML Kit if both people
+       * use the same language.
        */
       if (
-        !isFinal &&
-        version !==
-          this.translationVersion
+        this.selectedLanguage ===
+        targetLanguage
       ) {
-        return;
+
+        translatedText =
+          cleanText;
+
+      } else {
+
+        const result =
+          await this.offlineTranslation
+            .translate(
+              cleanText,
+              this.selectedLanguage,
+              targetLanguage
+            );
+
+
+        translatedText =
+          result.translatedText;
       }
+
+
+      const mlKitMs =
+        Math.round(
+          performance.now() -
+          translationStartedAt
+        );
+
+
+      this.translationLog(
+        'MLKIT_DONE',
+        {
+          segmentId,
+
+          originalText:
+            cleanText,
+
+          translatedText,
+
+          words:
+            this.splitWords(
+              cleanText
+            ).length,
+
+          mlKitMs,
+
+          isFinal
+        }
+      );
 
 
       const subtitle:
@@ -491,8 +1095,7 @@ export class ConversationPageComponent
         originalText:
           cleanText,
 
-        translatedText:
-          result.translatedText,
+        translatedText,
 
         sourceLanguage:
           this.selectedLanguage,
@@ -504,9 +1107,25 @@ export class ConversationPageComponent
 
 
       /*
-       * Sender sees exactly the same pair
-       * that the remote participant receives.
+       * Sender sees exactly the same original
+       * + translation pair as the receiver.
        */
+      this.translationLog(
+        'LOCAL_SUBTITLE',
+        {
+          segmentId,
+
+          originalText:
+            subtitle.originalText,
+
+          translatedText:
+            subtitle.translatedText,
+
+          isFinal
+        }
+      );
+
+
       this.subtitle.set(
         subtitle
       );
@@ -518,14 +1137,22 @@ export class ConversationPageComponent
       );
 
 
-      this.lastTranslatedText =
-        cleanText;
+      /*
+       * Store a completed delivered subtitle
+       * in local transcript history.
+       */
+      this.addSubtitleToHistory(
+        subtitle
+      );
 
 
-      if (isFinal) {
-
-        this.finishSegment();
-      }
+      this.translationLog(
+        'SIGNALR_SENT',
+        {
+          segmentId,
+          isFinal
+        }
+      );
 
     } catch (error) {
 
@@ -537,25 +1164,91 @@ export class ConversationPageComponent
   }
 
 
-  private finishSegment(): void {
+  /*
+   * =========================================================
+   * SUBTITLE HISTORY
+   * =========================================================
+   */
 
-    this.translationVersion++;
+
+  private addSubtitleToHistory(
+    subtitle: SubtitleMessage
+  ): void {
+
+    /*
+     * Protect against accidental duplicate
+     * delivery of the same subtitle ID.
+     */
+    this.subtitleHistory.update(
+      history => {
+
+        if (
+          history.some(
+            item =>
+              item.segmentId ===
+              subtitle.segmentId
+          )
+        ) {
+          return history;
+        }
+
+
+        return [
+          ...history,
+          subtitle
+        ];
+      }
+    );
+  }
+
+
+  toggleHistory():
+    void {
+
+    this.historyOpen.update(
+      open => !open
+    );
+  }
+
+
+  /*
+   * Reset state belonging to one Sherpa
+   * recognition stream.
+   *
+   * Subtitle history is intentionally NOT
+   * cleared here.
+   */
+  private resetSherpaSegment():
+    void {
 
     this.cancelTranslationTimer();
 
+    this.consumedWords = 0;
+
+    this.latestPartialText = '';
+
     this.segmentCounter++;
 
-    this.activeSegmentId =
-      this.createSegmentId();
 
-    this.lastScheduledText = '';
-
-    this.lastTranslatedText = '';
+    this.translationLog(
+      'SHERPA_SEGMENT_RESET',
+      {
+        segmentCounter:
+          this.segmentCounter
+      }
+    );
   }
 
 
   private createSegmentId():
     string {
+
+    /*
+     * Date + monotonically increasing counter
+     * gives each local subtitle chunk a
+     * different ID.
+     */
+    this.segmentCounter++;
 
     return `${Date.now()}-${this.segmentCounter}`;
   }
@@ -579,6 +1272,13 @@ export class ConversationPageComponent
   }
 
 
+  /*
+   * =========================================================
+   * WEBRTC SIGNALING
+   * =========================================================
+   */
+
+
   private registerWebRtcSignaling():
     void {
 
@@ -592,16 +1292,19 @@ export class ConversationPageComponent
 
         await this.ensureWebRtc();
 
+
         const answer =
           await this.webRtc.acceptOffer(
             offer
           );
+
 
         await this.signalR
           .sendWebRtcAnswer(
             this.sessionId.trim(),
             answer
           );
+
 
         this.bindVideoStreams();
       }
@@ -647,14 +1350,24 @@ export class ConversationPageComponent
         }
       );
 
+
     this.bindVideoStreams();
   }
 
 
-  async send(): Promise<void> {
+  /*
+   * =========================================================
+   * MANUAL TEXT CHAT
+   * =========================================================
+   */
+
+
+  async send():
+    Promise<void> {
 
     const text =
       this.messageText.trim();
+
 
     if (
       !text ||
@@ -663,10 +1376,12 @@ export class ConversationPageComponent
       return;
     }
 
+
     await this.signalR.sendText(
       this.sessionId.trim(),
       text
     );
+
 
     this.messages.update(
       messages => [
@@ -678,8 +1393,16 @@ export class ConversationPageComponent
       ]
     );
 
+
     this.messageText = '';
   }
+
+
+  /*
+   * =========================================================
+   * CALL
+   * =========================================================
+   */
 
 
   async startCall():
@@ -688,6 +1411,19 @@ export class ConversationPageComponent
     if (!this.joined()) {
       return;
     }
+
+
+    /*
+     * New call = clean subtitle state.
+     */
+    this.resetSherpaSegment();
+
+    this.lastObservedFinal = '';
+
+    this.subtitle.set(
+      null
+    );
+
 
     await this.webRtc
       .createPeerConnection(
@@ -702,8 +1438,10 @@ export class ConversationPageComponent
         true
       );
 
+
     const offer =
       await this.webRtc.createOffer();
+
 
     await this.signalR
       .sendWebRtcOffer(
@@ -718,10 +1456,24 @@ export class ConversationPageComponent
 
     this.cancelTranslationTimer();
 
-    this.subtitle.set(null);
+    this.resetSherpaSegment();
+
+    this.lastObservedFinal = '';
+
+    this.subtitle.set(
+      null
+    );
+
 
     await this.webRtc.endCall();
   }
+
+
+  /*
+   * =========================================================
+   * VIDEO
+   * =========================================================
+   */
 
 
   private bindVideoStreams():
@@ -733,6 +1485,7 @@ export class ConversationPageComponent
     const remote =
       this.webRtc.remoteMediaStream();
 
+
     if (
       local &&
       this.localVideo
@@ -742,6 +1495,7 @@ export class ConversationPageComponent
         .nativeElement
         .srcObject = local;
     }
+
 
     if (
       remote &&
@@ -755,10 +1509,18 @@ export class ConversationPageComponent
   }
 
 
+  /*
+   * =========================================================
+   * DESTROY
+   * =========================================================
+   */
+
+
   async ngOnDestroy():
     Promise<void> {
 
     this.cancelTranslationTimer();
+
 
     if (this.joined()) {
 
@@ -768,6 +1530,32 @@ export class ConversationPageComponent
         );
     }
 
+
     await this.signalR.disconnect();
   }
+
+
+  /*
+   * =========================================================
+   * DEBUG
+   * =========================================================
+   */
+
+
+  private translationLog(
+    event: string,
+    data: Record<string, unknown> = {}
+  ): void {
+
+    console.log(
+      '★★★★★ LINGO_TRANSLATION',
+      event,
+      JSON.stringify({
+        time: Date.now(),
+        ...data
+      }),
+      '★★★★★'
+    );
+  }
 }
+
