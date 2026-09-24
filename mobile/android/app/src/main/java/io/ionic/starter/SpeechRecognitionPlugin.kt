@@ -67,6 +67,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
     private var testingRecognitionServices = false
     private var selectedWorkingService: RecognitionServiceCandidate? = null
     private var serviceTestRunnable: Runnable? = null
+    private var googleUtteranceId = 1L
 
     override fun load() {
         sherpa = SherpaStreamingRecognizer(context, this)
@@ -239,12 +240,12 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         sendState("ready", "sherpa")
     }
 
-    override fun onSherpaPartial(text: String, language: String) {
-        emitResult("partialResult", text, "sherpa", language, false)
+    override fun onSherpaPartial(text: String, language: String, utteranceId: Long) {
+        emitResult("partialResult", text, "sherpa", language, false, utteranceId)
     }
 
-    override fun onSherpaFinal(text: String, language: String) {
-        emitResult("finalResult", text, "sherpa", language, true)
+    override fun onSherpaFinal(text: String, language: String, utteranceId: Long) {
+        emitResult("finalResult", text, "sherpa", language, true, utteranceId)
     }
 
     override fun onSherpaError(message: String) {
@@ -266,6 +267,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         engine: String,
         resultLanguage: String,
         isFinal: Boolean,
+        utteranceId: Long = 0L,
     ) {
         if (text.isBlank()) return
         notifyListeners(
@@ -275,6 +277,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                 put("engine", engine)
                 put("language", resultLanguage)
                 put("isFinal", isFinal)
+                put("utteranceId", utteranceId)
             },
         )
     }
@@ -442,7 +445,10 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                if (text.isNotBlank()) emitResult("finalResult", text, "google", language, true)
+                if (text.isNotBlank()) {
+                    emitResult("finalResult", text, "google", language, true, googleUtteranceId)
+                    googleUtteranceId++
+                }
                 if (keepListening && !testingRecognitionServices && !sherpaActive)
                     restartAfter(250L)
             }
@@ -453,7 +459,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                if (text.isNotBlank()) emitResult("partialResult", text, "google", language, false)
+                if (text.isNotBlank()) emitResult("partialResult", text, "google", language, false, googleUtteranceId)
             }
 
             override fun onEvent(eventType: Int, params: Bundle?) {}

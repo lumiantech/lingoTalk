@@ -16,9 +16,9 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
     interface Listener {
         fun onSherpaReady(language: String)
 
-        fun onSherpaPartial(text: String, language: String)
+        fun onSherpaPartial(text: String, language: String, utteranceId: Long)
 
-        fun onSherpaFinal(text: String, language: String)
+        fun onSherpaFinal(text: String, language: String, utteranceId: Long)
 
         fun onSherpaError(message: String)
     }
@@ -38,6 +38,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
     private var language = "auto"
     private var lastText = ""
+    private var utteranceId = 1L
 
     // ============================================================
     // DIAGNOSTICS
@@ -138,6 +139,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     }
 
                 lastText = ""
+                utteranceId = 1L
 
                 pcmChunkCount = 0L
                 totalPcmBytes = 0L
@@ -324,7 +326,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                     lastText = text
 
-                    listener.onSherpaPartial(text, language)
+                    listener.onSherpaPartial(text, language, utteranceId)
                 }
 
                 // ------------------------------------------------
@@ -341,16 +343,17 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                         Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
 
-                        listener.onSherpaFinal(text, language)
+                        listener.onSherpaFinal(text, language, utteranceId)
                     }
 
                     r.reset(s)
+                    utteranceId++
 
                     s.setOption("language", language)
 
                     lastText = ""
 
-                    Log.i(TAG, "★★★★★ STREAM RESET language=$language ★★★★★")
+                    Log.i(TAG, "★★★★★ STREAM RESET language=$language nextUtteranceId=$utteranceId ★★★★★")
                 }
             } catch (e: Exception) {
 

@@ -15,6 +15,7 @@ export interface SpeechResult {
   engine: SttEngine;
   language: string;
   isFinal: boolean;
+  utteranceId: number;
 }
 
 interface ModelInstallResult {
@@ -78,6 +79,9 @@ export class SpeechRecognitionService {
 
   readonly partialText = signal('');
   readonly finalText = signal('');
+
+  readonly partialUtteranceId = signal(0);
+  readonly finalUtteranceId = signal(0);
 
   readonly state = signal('stopped');
 
@@ -309,6 +313,7 @@ export class SpeechRecognitionService {
       'partialResult',
       data => {
 
+        this.partialUtteranceId.set(data.utteranceId ?? 0);
         this.partialText.set(data.text);
 
         this.engine.set(
@@ -325,6 +330,7 @@ export class SpeechRecognitionService {
       'finalResult',
       data => {
 
+        this.finalUtteranceId.set(data.utteranceId ?? 0);
         this.finalText.set(data.text);
 
         this.partialText.set('');
