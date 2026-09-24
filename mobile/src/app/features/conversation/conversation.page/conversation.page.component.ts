@@ -28,18 +28,12 @@ import {
 
 import { Capacitor } from '@capacitor/core';
 
-import {
-  SubtitleMessage,
-  TranslationSignalRService
-} from '../../../core/services/translation-signal-r';
+
 
 import {
   OfflineTranslationService
 } from '../../../core/services/offline-translation.service';
 
-import {
-  PremiumTranslationService
-} from '../../../core/services/premium-translation.service';
 
 import {
   environment
@@ -52,6 +46,7 @@ import {
 import {
   SpeechRecognitionService
 } from '../../../core/services/speech-recognition.service';
+import { SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
 
 
 interface ConversationMessage {
@@ -102,8 +97,6 @@ export class ConversationPageComponent
   private readonly offlineTranslation =
     inject(OfflineTranslationService);
 
-  private readonly premiumTranslation =
-    inject(PremiumTranslationService);
 
   /*
    * Translation engine.
@@ -186,11 +179,12 @@ export class ConversationPageComponent
    * This is intentionally separate from
    * manual text chat.
    */
-  readonly subtitleHistory =
-    signal<SubtitleMessage[]>([]);
+  readonly localHistory = signal<SubtitleMessage[]>([]);
+  readonly aiHistory = signal<SubtitleMessage[]>([]);
+  readonly historyOpen = signal(false);
+  readonly activeHistory = signal<'local' | 'ai'>('local');
 
-  readonly historyOpen =
-    signal(false);
+  private latestDisplayedSegmentId = '';
 
   // Call UI state. Audio/video track control stays inside WebRtcService.
   readonly microphoneEnabled = signal(true);
@@ -260,6 +254,8 @@ export class ConversationPageComponent
    */
   private readonly targetChunkWords = 5;
 
+  private readonly targetChunkChars = 30;
+
   private readonly maxChunkWords = 5;
 
   private readonly pauseMs = 350;
@@ -268,16 +264,6 @@ export class ConversationPageComponent
   private translationTimer:
     ReturnType<typeof setTimeout> | undefined;
 
-  /*
-   * All translation jobs are serialized.
-   *
-   * This is important for Premium:
-   * chunk 2 must not overtake chunk 1, and
-   * when chunk 2 starts, chunk 1 is already
-   * available in subtitleHistory as context.
-   */
-  private translationQueue:
-    Promise<void> = Promise.resolve();
 
 
   constructor() {
@@ -502,47 +488,34 @@ export class ConversationPageComponent
     this.signalR
       .onSubtitleReceived(
         subtitle => {
+          // LOCAL from the other participant arrives immediately.
+          this.subtitle.set(subtitle);
+          this.latestDisplayedSegmentId = subtitle.segmentId;
+          this.liveSttText.set(subtitle.originalText);
+          this.liveLocalTranslation.set(subtitle.translatedText);
+          this.liveLocalSourceText = subtitle.originalText.trim();
+          this.liveAiOriginal.set('');
+          this.liveAiTranslation.set('');
+          this.liveAiPending.set(subtitle.requestAi);
+          this.addLocalHistory(subtitle);
+        }
+      );
 
-          this.translationLog(
-            'SIGNALR_RECEIVED',
-            {
-              segmentId:
-                subtitle.segmentId,
+    this.signalR
+      .onAiSubtitleReceived(
+        subtitle => {
+          // AI is broadcast by backend to BOTH sender and receiver.
+          this.addAiHistory(subtitle);
 
-              originalText:
-                subtitle.originalText,
-
-              translatedText:
-                subtitle.translatedText,
-
-              isFinal:
-                subtitle.isFinal
-            }
-          );
-
-          this.subtitle.set(
-            subtitle
-          );
-
-          // Remote side must show the same 3-line view as the sender.
-          // isFinal=false = fast Sherpa + local/ML Kit result.
-          // isFinal=true  = later OpenAI correction/translation for same segment.
-          if (!subtitle.isFinal) {
-            this.liveSttText.set(subtitle.originalText);
-            this.liveLocalTranslation.set(subtitle.translatedText);
-            this.liveLocalSourceText = subtitle.originalText.trim();
-            this.liveAiOriginal.set('');
-            this.liveAiTranslation.set('');
-            this.liveAiPending.set(true);
-          } else {
-            this.liveAiOriginal.set(subtitle.originalText);
-            this.liveAiTranslation.set(subtitle.translatedText);
-            this.liveAiPending.set(false);
+          // An older OpenAI request may finish after a newer segment.
+          // Never let it overwrite the newest live subtitle card.
+          if (subtitle.segmentId !== this.latestDisplayedSegmentId) {
+            return;
           }
 
-          this.addSubtitleToHistory(
-            subtitle
-          );
+          this.liveAiOriginal.set(subtitle.originalText);
+          this.liveAiTranslation.set(subtitle.translatedText);
+          this.liveAiPending.set(false);
         }
       );
 
@@ -618,54 +591,111 @@ export class ConversationPageComponent
       return;
     }
 
-    const words =
-      this.splitWords(fullText);
+    const cleanText =
+      fullText.trim();
 
-    /*
-     * Sherpa can revise the current hypothesis.
-     * Already committed words belong to older subtitle chunks;
-     * only the uncommitted tail is allowed to change on screen.
-     */
-    if (words.length < this.consumedWords) {
+    if (!cleanText) {
       return;
     }
+
+    const words =
+      this.splitWords(cleanText);
+
+    /*
+     * Native Sherpa resets its stream after an endpoint. A new
+     * utterance therefore starts again with a short hypothesis.
+     * Never compare that new 1-3 word hypothesis with consumedWords
+     * left from the previous utterance.
+     */
+    if (
+      this.consumedWords > 0 &&
+      words.length < this.consumedWords
+    ) {
+      this.translationLog(
+        'NEW_SHERPA_UTTERANCE_DETECTED',
+        {
+          text: cleanText,
+          words: words.length,
+          previousConsumedWords:
+            this.consumedWords
+        }
+      );
+
+      this.resetChunkStateForNewUtterance();
+    }
+
+    this.latestPartialText =
+      cleanText;
 
     this.cancelTranslationTimer();
 
     let remaining =
-      words.slice(this.consumedWords);
+      words.slice(
+        this.consumedWords
+      );
+
+    if (remaining.length === 0) {
+      return;
+    }
 
     /*
-     * Commit every complete 5-word chunk.
+     * Rolling display:
+     *   1 word  -> show/translate 1 word
+     *   2 words -> replace with 1+2 and translate
+     *   3 words -> replace with 1+2+3 and translate
      *
-     * Before commit, the exact same text is already visible through
-     * liveSttText + liveLocalTranslation.
+     * Commit at 5 words OR about 30 characters.
      */
-    while (
-      remaining.length >=
-      this.targetChunkWords
-    ) {
-      const chunkWords =
-        remaining.slice(
-          0,
-          this.maxChunkWords
+    while (remaining.length > 0) {
+
+      const candidateWords: string[] = [];
+
+      for (const word of remaining) {
+
+        candidateWords.push(word);
+
+        const candidateText =
+          candidateWords.join(' ');
+
+        if (
+          candidateWords.length >=
+          this.targetChunkWords ||
+          candidateText.length >=
+          this.targetChunkChars
+        ) {
+          break;
+        }
+      }
+
+      const candidateText =
+        candidateWords.join(' ');
+
+      const shouldCommit =
+        candidateWords.length >=
+        this.targetChunkWords ||
+        candidateText.length >=
+        this.targetChunkChars;
+
+      if (!shouldCommit) {
+
+        this.showLiveChunk(
+          candidateText
         );
 
-      const chunk =
-        chunkWords.join(' ');
+        this.schedulePauseCommit();
 
-      /*
-       * Show/translate the complete chunk immediately.
-       * This also catches the case where Sherpa jumped from
-       * 3 directly to 5+ words in one partial.
-       */
-      this.showLiveChunk(chunk);
+        return;
+      }
+
+      this.showLiveChunk(
+        candidateText
+      );
 
       this.consumedWords +=
-        chunkWords.length;
+        candidateWords.length;
 
       void this.commitChunk(
-        chunk,
+        candidateText,
         false
       );
 
@@ -673,35 +703,6 @@ export class ConversationPageComponent
         words.slice(
           this.consumedWords
         );
-    }
-
-    /*
-     * 1-4 words are NOT hidden anymore.
-     *
-     * Example:
-     *   "Where"          -> show + ML Kit now
-     *   "Where are"      -> replace + ML Kit now
-     *   "Where are the"  -> replace + ML Kit now
-     *
-     * Sherpa is free to correct earlier words because this is one
-     * replaceable live hypothesis, not append-only text.
-     */
-    if (remaining.length > 0) {
-      const liveChunk =
-        remaining
-          .slice(0, this.maxChunkWords)
-          .join(' ');
-
-      this.showLiveChunk(
-        liveChunk
-      );
-
-      /*
-       * If the user stops after 1-4 words, commit exactly what is
-       * already visible after the short pause. ML Kit has already
-       * translated it; this timer is primarily for OpenAI/history.
-       */
-      this.schedulePauseCommit();
     }
   }
 
@@ -729,6 +730,7 @@ export class ConversationPageComponent
     // and mark AI as pending only after commit.
     this.liveAiOriginal.set('');
     this.liveAiTranslation.set('');
+    this.liveAiPending.set(false);
 
     /*
      * Translate every changed hypothesis locally.
@@ -853,6 +855,20 @@ export class ConversationPageComponent
               this.latestPartialText
             );
 
+          if (words.length === 0) {
+            return;
+          }
+
+          if (
+            this.consumedWords > 0 &&
+            words.length < this.consumedWords
+          ) {
+            this.resetChunkStateForNewUtterance();
+
+            this.latestPartialText =
+              words.join(' ');
+          }
+
           const remaining =
             words.slice(
               this.consumedWords
@@ -864,22 +880,39 @@ export class ConversationPageComponent
             return;
           }
 
-          const chunkWords =
-            remaining.slice(
-              0,
-              this.maxChunkWords
-            );
+          /*
+           * A pause commits even 1-3 words. It must never wait for
+           * the normal 5-word boundary.
+           */
+          const chunkWords: string[] = [];
+
+          for (const word of remaining) {
+
+            chunkWords.push(word);
+
+            const candidate =
+              chunkWords.join(' ');
+
+            if (
+              chunkWords.length >=
+              this.maxChunkWords ||
+              candidate.length >=
+              this.targetChunkChars
+            ) {
+              break;
+            }
+          }
 
           const chunk =
             chunkWords.join(' ');
 
+          if (!chunk) {
+            return;
+          }
+
           this.consumedWords +=
             chunkWords.length;
 
-          /*
-           * Local STT + ML Kit were already shown immediately.
-           * Pause now commits the chunk to OpenAI + SignalR/history.
-           */
           void this.commitChunk(
             chunk,
             false
@@ -905,16 +938,45 @@ export class ConversationPageComponent
    * Sherpa FINAL can contain a correction or words not seen in the
    * latest partial. Show those words immediately, then commit them.
    */
-  private async flushFinalText(
+  private flushFinalText(
     finalText: string
-  ): Promise<void> {
+  ): void {
 
     this.cancelTranslationTimer();
 
+    const cleanFinal =
+      finalText.trim();
+
+    if (!cleanFinal) {
+      this.resetSherpaSegment();
+      return;
+    }
+
     const words =
       this.splitWords(
-        finalText
+        cleanFinal
       );
+
+    /*
+     * A shorter FINAL cannot use consumedWords from the previous
+     * native Sherpa utterance.
+     */
+    if (
+      this.consumedWords > 0 &&
+      words.length < this.consumedWords
+    ) {
+      this.translationLog(
+        'FINAL_NEW_UTTERANCE_DETECTED',
+        {
+          finalText: cleanFinal,
+          words: words.length,
+          previousConsumedWords:
+            this.consumedWords
+        }
+      );
+
+      this.resetChunkStateForNewUtterance();
+    }
 
     if (
       words.length <=
@@ -932,19 +994,32 @@ export class ConversationPageComponent
     while (
       remaining.length > 0
     ) {
-      const chunkWords =
-        remaining.slice(
-          0,
-          this.maxChunkWords
-        );
 
-      remaining =
-        remaining.slice(
-          chunkWords.length
-        );
+      const chunkWords: string[] = [];
+
+      for (const word of remaining) {
+
+        chunkWords.push(word);
+
+        const candidate =
+          chunkWords.join(' ');
+
+        if (
+          chunkWords.length >=
+          this.maxChunkWords ||
+          candidate.length >=
+          this.targetChunkChars
+        ) {
+          break;
+        }
+      }
 
       const chunk =
         chunkWords.join(' ');
+
+      if (!chunk) {
+        break;
+      }
 
       this.showLiveChunk(
         chunk
@@ -953,7 +1028,12 @@ export class ConversationPageComponent
       this.consumedWords +=
         chunkWords.length;
 
-      await this.commitChunk(
+      remaining =
+        words.slice(
+          this.consumedWords
+        );
+
+      void this.commitChunk(
         chunk,
         remaining.length === 0
       );
@@ -991,302 +1071,88 @@ export class ConversationPageComponent
    * COMMIT path:
    * 5 words OR 650 ms pause/final -> OpenAI -> UI + SignalR/history
    */
-  private commitChunk(
+  private async commitChunk(
     originalText: string,
-    isFinal: boolean
+    _isFinal: boolean
   ): Promise<void> {
 
-    const cleanText =
-      originalText.trim();
+    const cleanText = originalText.trim();
+    if (!cleanText) return;
 
-    if (!cleanText) {
-      return Promise.resolve();
-    }
+    if (cleanText === this.lastCommittedChunk) return;
+    this.lastCommittedChunk = cleanText;
 
-    /*
-     * A FINAL immediately after a pause can contain the same text.
-     * Do not start a duplicate OpenAI request.
-     */
-    if (
-      cleanText ===
-      this.lastCommittedChunk
-    ) {
-      return Promise.resolve();
-    }
+    const targetLanguage = this.remoteLanguage();
+    if (!targetLanguage || !this.joined()) return;
 
-    this.lastCommittedChunk =
-      cleanText;
-
-    const job =
-      this.translationQueue.then(
-        () =>
-          this.commitChunkNow(
-            cleanText,
-            isFinal
-          )
-      );
-
-    this.translationQueue =
-      job.catch(error => {
-
-        console.error(
-          '★★★★★ COMMITTED TRANSLATION FAILED ★★★★★',
-          error
-        );
-      });
-
-    return job;
-  }
-
-
-  private async commitChunkNow(
-    cleanText: string,
-    isFinal: boolean
-  ): Promise<void> {
-
-    const targetLanguage =
-      this.remoteLanguage();
-
-    if (
-      !targetLanguage ||
-      !this.joined()
-    ) {
-      return;
-    }
-
-    const segmentId =
-      this.createSegmentId();
-
-    /*
-     * Ensure that a committed chunk has a local translation too.
-     * Usually the rolling ML Kit request has already produced it,
-     * but this makes the committed result deterministic.
-     */
-    let localTranslatedText =
-      cleanText;
+    const segmentId = this.createSegmentId();
+    let localTranslatedText = cleanText;
 
     try {
-      // Do not translate the same text twice. The rolling live ML Kit
-      // result is normally already ready by the time this chunk commits.
+      // Reuse the rolling ML Kit result whenever it belongs to this exact text.
       if (
         this.liveLocalSourceText === cleanText &&
         this.liveLocalTranslation().trim()
       ) {
         localTranslatedText = this.liveLocalTranslation().trim();
       } else if (
-        this.selectedLanguage !==
-        targetLanguage &&
+        this.selectedLanguage !== targetLanguage &&
         Capacitor.isNativePlatform() &&
-        Capacitor.getPlatform() ===
-        'android'
+        Capacitor.getPlatform() === 'android'
       ) {
-        const localResult =
-          await this.offlineTranslation
-            .translate(
-              cleanText,
-              this.selectedLanguage,
-              targetLanguage
-            );
-
-        localTranslatedText =
-          localResult.translatedText;
-      }
-
-      /*
-       * Do not overwrite a newer rolling chunk's translation.
-       * We only force the local value when the committed text is
-       * still the text currently visible.
-       */
-      if (
-        this.liveSttText().trim() ===
-        cleanText
-      ) {
-        this.liveLocalTranslation.set(
-          localTranslatedText
+        const localResult = await this.offlineTranslation.translate(
+          cleanText,
+          this.selectedLanguage,
+          targetLanguage
         );
+        localTranslatedText = localResult.translatedText;
       }
-
     } catch (error) {
-
-      console.error(
-        '★★★★★ COMMITTED ML KIT FAILED ★★★★★',
-        error
-      );
+      console.error('★★★★★ COMMITTED ML KIT FAILED ★★★★★', error);
     }
 
-    /*
-     * Publish the fast/local pair immediately.
-     *
-     * Existing SignalR protocol understands this pair already,
-     * so the remote side does not have to wait for OpenAI.
-     */
-    const fastSubtitle:
-      SubtitleMessage = {
-
+    const localSubtitle: SubtitleMessage = {
       segmentId,
-
-      originalText:
-        cleanText,
-
-      translatedText:
-        localTranslatedText,
-
-      sourceLanguage:
-        this.selectedLanguage,
-
+      originalText: cleanText,
+      translatedText: localTranslatedText,
+      sourceLanguage: this.selectedLanguage,
       targetLanguage,
-
-      isFinal: false
+      stage: 'local',
+      requestAi: this.translationMode === 'premium'
     };
 
-    this.subtitle.set(
-      fastSubtitle
-    );
+    // Sender stores LOCAL immediately. No OpenAI wait.
+    this.subtitle.set(localSubtitle);
+    this.latestDisplayedSegmentId = segmentId;
+    this.addLocalHistory(localSubtitle);
+
+    if (this.liveSttText().trim() === cleanText) {
+      this.liveLocalTranslation.set(localTranslatedText);
+      this.liveLocalSourceText = cleanText;
+      this.liveAiOriginal.set('');
+      this.liveAiTranslation.set('');
+      this.liveAiPending.set(localSubtitle.requestAi);
+    }
 
     try {
+      // Hub relays LOCAL immediately, then only QUEUES OpenAI.
+      // This await waits for the short Hub invocation, NOT for OpenAI.
       await this.signalR.sendSubtitle(
         this.sessionId.trim(),
-        fastSubtitle
-      );
-    } catch (error) {
-      console.error(
-        '★★★★★ FAST SUBTITLE SIGNALR FAILED ★★★★★',
-        error
-      );
-    }
-
-    /*
-     * FREE mode stops here.
-     * PREMIUM mode additionally produces the OpenAI line below.
-     */
-    if (
-      this.translationMode !==
-      'premium'
-    ) {
-      this.addSubtitleToHistory(
-        {
-          ...fastSubtitle,
-          isFinal
-        }
+        localSubtitle
       );
 
-      return;
-    }
-
-    this.liveAiPending.set(true);
-
-    try {
-      const context =
-        this.subtitleHistory()
-          .slice(-3)
-          .map(item => ({
-            originalText:
-              item.originalText,
-
-            translatedText:
-              item.translatedText
-          }));
-
-      const result =
-        await this.premiumTranslation
-          .translate(
-            cleanText,
-            this.selectedLanguage,
-            targetLanguage,
-            context
-          );
-
-      /*
-       * IMPORTANT:
-       * We intentionally keep BOTH translations:
-       *
-       * liveLocalTranslation = ML Kit
-       * liveAiTranslation    = OpenAI
-       */
-      this.liveAiOriginal.set(
-        result.correctedOriginalText
-      );
-
-      this.liveAiTranslation.set(
-        result.translatedText
-      );
-
-      const aiSubtitle:
-        SubtitleMessage = {
-
-        /*
-         * Same segmentId: this is the final AI version of the
-         * already delivered fast/local segment.
-         */
+      this.translationLog('LOCAL_SIGNALR_SENT', {
         segmentId,
-
-        originalText:
-          result.correctedOriginalText,
-
-        translatedText:
-          result.translatedText,
-
-        sourceLanguage:
-          this.selectedLanguage,
-
-        targetLanguage,
-
-        isFinal: true
-      };
-
-      this.subtitle.set(
-        aiSubtitle
-      );
-
-      /*
-       * With the CURRENT protocol the remote side receives this as
-       * the final version of the same segment. The sender can show
-       * ML Kit + OpenAI simultaneously through the live signals.
-       */
-      await this.signalR.sendSubtitle(
-        this.sessionId.trim(),
-        aiSubtitle
-      );
-
-      this.addSubtitleToHistory(
-        aiSubtitle
-      );
-
-      this.translationLog(
-        'OPENAI_DONE',
-        {
-          segmentId,
-          rawSttText:
-            cleanText,
-          correctedOriginalText:
-            result.correctedOriginalText,
-          localTranslatedText,
-          aiTranslatedText:
-            result.translatedText
-        }
-      );
-
+        originalText: cleanText,
+        translatedText: localTranslatedText,
+        requestAi: localSubtitle.requestAi
+      });
     } catch (error) {
-
-      /*
-       * OpenAI failure must never remove the already visible
-       * Sherpa + ML Kit result.
-       */
-      console.error(
-        '★★★★★ OPENAI TRANSLATION FAILED ★★★★★',
-        error
-      );
-
-      this.addSubtitleToHistory(
-        {
-          ...fastSubtitle,
-          isFinal
-        }
-      );
-
-    } finally {
-
-      this.liveAiPending.set(false);
+      console.error('★★★★★ LOCAL SUBTITLE SIGNALR FAILED ★★★★★', error);
+      if (this.latestDisplayedSegmentId === segmentId) {
+        this.liveAiPending.set(false);
+      }
     }
   }
 
@@ -1319,42 +1185,90 @@ export class ConversationPageComponent
    */
 
 
-  private addSubtitleToHistory(
-    subtitle: SubtitleMessage
-  ): void {
+  private addLocalHistory(subtitle: SubtitleMessage): void {
+    this.localHistory.update(history => {
+      if (history.some(item => item.segmentId === subtitle.segmentId)) return history;
+      return [...history, subtitle];
+    });
+    this.keepHistoryAtBottomIfNeeded();
+  }
 
-    /*
-     * Protect against accidental duplicate
-     * delivery of the same subtitle ID.
-     */
-    this.subtitleHistory.update(
-      history => {
-
-        if (
-          history.some(
-            item =>
-              item.segmentId ===
-              subtitle.segmentId
-          )
-        ) {
-          return history;
-        }
-
-
-        return [
-          ...history,
-          subtitle
-        ];
+  private addAiHistory(subtitle: SubtitleMessage): void {
+    this.aiHistory.update(history => {
+      const index = history.findIndex(item => item.segmentId === subtitle.segmentId);
+      if (index < 0) {
+        return [...history, subtitle].sort((a, b) =>
+          this.segmentOrder(a.segmentId) - this.segmentOrder(b.segmentId)
+        );
       }
-    );
+      const copy = [...history];
+      copy[index] = subtitle;
+      return copy;
+    });
+    this.keepHistoryAtBottomIfNeeded();
+  }
+
+  private segmentOrder(segmentId: string): number {
+    const timestamp = Number(segmentId.split('-')[0]);
+    return Number.isFinite(timestamp) ? timestamp : 0;
+  }
+
+  setActiveHistory(tab: 'local' | 'ai'): void {
+    this.activeHistory.set(tab);
+    setTimeout(() => this.scrollHistoryToBottom(), 0);
+  }
+
+  toggleHistory(): void {
+    const opening = !this.historyOpen();
+    this.historyOpen.set(opening);
+    if (opening) setTimeout(() => this.scrollHistoryToBottom(), 0);
+  }
+
+  private keepHistoryAtBottomIfNeeded(): void {
+    if (!this.historyOpen()) return;
+    const el = document.querySelector('.history-content') as HTMLElement | null;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distance <= 80) setTimeout(() => this.scrollHistoryToBottom(), 0);
+  }
+
+  private scrollHistoryToBottom(): void {
+    const el = document.querySelector('.history-content') as HTMLElement | null;
+    if (el) el.scrollTop = el.scrollHeight;
   }
 
 
-  toggleHistory():
+  /*
+   * Reset only rolling/chunk state when a new native Sherpa
+   * utterance is detected. Do not clear history, WebRTC or STT.
+   */
+  private resetChunkStateForNewUtterance():
     void {
 
-    this.historyOpen.update(
-      open => !open
+    this.cancelTranslationTimer();
+
+    this.consumedWords = 0;
+
+    this.latestPartialText = '';
+
+    this.liveTranslationRevision++;
+
+    this.liveLocalSourceText = '';
+
+    this.lastCommittedChunk = '';
+
+    /*
+     * Prevent a late AI result from the previous committed segment
+     * from being attached visually to a new uncommitted hypothesis.
+     */
+    this.latestDisplayedSegmentId = '';
+
+    this.translationLog(
+      'CHUNK_STATE_RESET',
+      {
+        segmentCounter:
+          this.segmentCounter
+      }
     );
   }
 
@@ -1381,8 +1295,7 @@ export class ConversationPageComponent
      */
     this.liveTranslationRevision++;
 
-    this.liveSttText.set('');
-    this.liveLocalTranslation.set('');
+    // Keep the last committed subtitle visible until the next partial arrives.
     this.liveLocalSourceText = '';
 
     /*

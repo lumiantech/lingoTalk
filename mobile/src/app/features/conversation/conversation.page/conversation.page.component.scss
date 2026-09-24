@@ -217,3 +217,30 @@
   font-size: 14px;
   font-style: italic;
 }
+
+/* LOCAL / AI history tabs */
+.history-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  padding: 10px 12px 0;
+}
+
+.history-tabs button {
+  min-height: 38px;
+  border: 1px solid rgba(255,255,255,.10);
+  border-radius: 12px;
+  background: rgba(255,255,255,.05);
+  color: rgba(230,246,255,.72);
+  font-weight: 800;
+  letter-spacing: .05em;
+}
+
+.history-tabs button.active {
+  color: white;
+  border-color: rgba(255,255,255,.22);
+  background: rgba(255,255,255,.11);
+}
+
+.local-history-item strong { color: #06b6d4; }
+.ai-history-item strong { color: #ff5a67; }

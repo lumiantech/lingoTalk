@@ -64,6 +64,12 @@ builder.Services.AddAuthorization();
 
 builder.Services.AddSignalR();
 
+// OpenAI translation jobs run outside the Hub invocation,
+// so LOCAL subtitles are never blocked by OpenAI.
+builder.Services.AddSingleton<AiTranslationDispatcher>();
+builder.Services.AddHostedService<AiTranslationDispatcher>(sp =>
+    sp.GetRequiredService<AiTranslationDispatcher>());
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("MobileApp", policy =>
