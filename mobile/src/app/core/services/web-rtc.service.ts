@@ -67,13 +67,14 @@ export class WebRtcService {
                     facingMode: 'user'
                 },
 
-                audio: {
-                    // This track is CALL AUDIO only.
-                    // Sherpa now records separately through native AudioRecord.
-                    echoCancellation: true,
-                    noiseSuppression: false,
-                    autoGainControl: false
-                }
+                // audio: {
+                //     // This track is CALL AUDIO only.
+                //     // Sherpa now records separately through native AudioRecord.
+                //     echoCancellation: true,
+                //     noiseSuppression: false,
+                //     autoGainControl: false
+                // }
+                 audio: false
             });
 
 

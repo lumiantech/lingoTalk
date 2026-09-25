@@ -156,12 +156,12 @@ export class ConversationPageComponent
 
   /*
    * LIVE subtitle pipeline:
-   * - liveSttText: newest Sherpa hypothesis for the current 1-5 word chunk
+   * - liveSttText: newest complete Sherpa hypothesis for the active utterance
    * - liveLocalTranslation: ML Kit translation of that exact hypothesis
    * - liveAiOriginal/liveAiTranslation: OpenAI result for the last committed chunk
    *
    * ML Kit is allowed to revise continuously as Sherpa revises its partial.
-   * OpenAI runs only when a chunk is committed (5 words or pause/final).
+   * OpenAI runs only after Sherpa FINAL; long finals may be split for history/network.
    */
   readonly liveSttText = signal('');
   readonly liveLocalTranslation = signal('');
@@ -248,17 +248,14 @@ export class ConversationPageComponent
    * absolute maximum when Sherpa jumps
    * over the 5-word boundary.
    *
-   * 650 ms:
-   * if the speaker pauses with only
-   * 1-4 pending words, translate them too.
+   * IMPORTANT: these limits are used only AFTER Sherpa FINAL.
+   * Active partials are never split or committed by a timer.
    */
   private readonly targetChunkWords = 5;
 
   private readonly targetChunkChars = 30;
 
   private readonly maxChunkWords = 5;
-
-  private readonly pauseMs = 350;
 
 
   private translationTimer:
@@ -271,40 +268,49 @@ export class ConversationPageComponent
     /*
      * WebRTC connection controls STT.
      */
-    effect(() => {
+    // effect(() => {
 
-      const callConnected =
-        this.webRtc.callConnected();
+    //   const callConnected =
+    //     this.webRtc.callConnected();
 
-      console.log(
-        '★★★★★ CALL CONNECTED:',
-        callConnected,
-        '★★★★★'
-      );
+    //   console.log(
+    //     '★★★★★ CALL CONNECTED:',
+    //     callConnected,
+    //     '★★★★★'
+    //   );
 
-      if (callConnected) {
+    //   if (callConnected) {
 
-        console.log(
-          '★★★★★ STARTING STT',
-          this.selectedLanguage,
-          '★★★★★'
-        );
+    //     console.log(
+    //       '★★★★★ STARTING STT',
+    //       this.selectedLanguage,
+    //       '★★★★★'
+    //     );
 
-        void this.speech.start(
-          this.selectedLanguage
-        );
+    //     void this.speech.start(
+    //       this.selectedLanguage
+    //     );
 
-      } else {
+    //   } else {
 
-        console.log(
-          '★★★★★ STOPPING STT ★★★★★'
-        );
+    //     console.log(
+    //       '★★★★★ STOPPING STT ★★★★★'
+    //     );
 
-        void this.speech.stop();
-      }
-    });
+    //     void this.speech.stop();
+    //   }
+    // });
 
+effect(() => {
 
+  console.log(
+    '★★★★★ A/B TEST A: SHERPA WITHOUT WEBRTC ★★★★★'
+  );
+
+  void this.speech.start(
+    this.selectedLanguage
+  );
+});
     /*
      * Observe Sherpa partials.
      *
@@ -598,114 +604,27 @@ export class ConversationPageComponent
       return;
     }
 
-    const words =
-      this.splitWords(cleanText);
-
     /*
-     * Native Sherpa resets its stream after an endpoint. A new
-     * utterance therefore starts again with a short hypothesis.
-     * Never compare that new 1-3 word hypothesis with consumedWords
-     * left from the previous utterance.
+     * IMPORTANT:
+     * Sherpa partial is the COMPLETE mutable hypothesis for the
+     * current utterance. Never consume/slice it while speech is active.
+     *
+     * Example:
+     *   need
+     *   need to
+     *   need to fix
+     *   need to fix this
+     *
+     * Every new hypothesis replaces the previous live STT and is
+     * translated immediately by ML Kit. Only Sherpa FINAL commits.
      */
-    if (
-      this.consumedWords > 0 &&
-      words.length < this.consumedWords
-    ) {
-      this.translationLog(
-        'NEW_SHERPA_UTTERANCE_DETECTED',
-        {
-          text: cleanText,
-          words: words.length,
-          previousConsumedWords:
-            this.consumedWords
-        }
-      );
-
-      this.resetChunkStateForNewUtterance();
-    }
-
     this.latestPartialText =
       cleanText;
 
-    this.cancelTranslationTimer();
-
-    let remaining =
-      words.slice(
-        this.consumedWords
-      );
-
-    if (remaining.length === 0) {
-      return;
-    }
-
-    /*
-     * Rolling display:
-     *   1 word  -> show/translate 1 word
-     *   2 words -> replace with 1+2 and translate
-     *   3 words -> replace with 1+2+3 and translate
-     *
-     * Commit at 5 words OR about 30 characters.
-     */
-    while (remaining.length > 0) {
-
-      const candidateWords: string[] = [];
-
-      for (const word of remaining) {
-
-        candidateWords.push(word);
-
-        const candidateText =
-          candidateWords.join(' ');
-
-        if (
-          candidateWords.length >=
-          this.targetChunkWords ||
-          candidateText.length >=
-          this.targetChunkChars
-        ) {
-          break;
-        }
-      }
-
-      const candidateText =
-        candidateWords.join(' ');
-
-      const shouldCommit =
-        candidateWords.length >=
-        this.targetChunkWords ||
-        candidateText.length >=
-        this.targetChunkChars;
-
-      if (!shouldCommit) {
-
-        this.showLiveChunk(
-          candidateText
-        );
-
-        this.schedulePauseCommit();
-
-        return;
-      }
-
-      this.showLiveChunk(
-        candidateText
-      );
-
-      this.consumedWords +=
-        candidateWords.length;
-
-      void this.commitChunk(
-        candidateText,
-        false
-      );
-
-      remaining =
-        words.slice(
-          this.consumedWords
-        );
-    }
+    this.showLiveChunk(
+      cleanText
+    );
   }
-
 
   private showLiveChunk(
     text: string
@@ -838,100 +757,6 @@ export class ConversationPageComponent
   }
 
 
-  private schedulePauseCommit():
-    void {
-
-    this.cancelTranslationTimer();
-
-    this.translationTimer =
-      setTimeout(
-        () => {
-
-          this.translationTimer =
-            undefined;
-
-          const words =
-            this.splitWords(
-              this.latestPartialText
-            );
-
-          if (words.length === 0) {
-            return;
-          }
-
-          if (
-            this.consumedWords > 0 &&
-            words.length < this.consumedWords
-          ) {
-            this.resetChunkStateForNewUtterance();
-
-            this.latestPartialText =
-              words.join(' ');
-          }
-
-          const remaining =
-            words.slice(
-              this.consumedWords
-            );
-
-          if (
-            remaining.length === 0
-          ) {
-            return;
-          }
-
-          /*
-           * A pause commits even 1-3 words. It must never wait for
-           * the normal 5-word boundary.
-           */
-          const chunkWords: string[] = [];
-
-          for (const word of remaining) {
-
-            chunkWords.push(word);
-
-            const candidate =
-              chunkWords.join(' ');
-
-            if (
-              chunkWords.length >=
-              this.maxChunkWords ||
-              candidate.length >=
-              this.targetChunkChars
-            ) {
-              break;
-            }
-          }
-
-          const chunk =
-            chunkWords.join(' ');
-
-          if (!chunk) {
-            return;
-          }
-
-          this.consumedWords +=
-            chunkWords.length;
-
-          void this.commitChunk(
-            chunk,
-            false
-          );
-
-          const stillRemaining =
-            words.length -
-            this.consumedWords;
-
-          if (stillRemaining > 0) {
-            this.processPartial(
-              this.latestPartialText
-            );
-          }
-
-        },
-        this.pauseMs
-      );
-  }
 
 
   /*
@@ -952,63 +777,58 @@ export class ConversationPageComponent
       return;
     }
 
+    /*
+     * FINAL is the authoritative utterance boundary. It may also
+     * contain a correction that was not present in the last partial,
+     * so show/translate the exact FINAL once more.
+     */
+    this.latestPartialText =
+      cleanFinal;
+
+    this.showLiveChunk(
+      cleanFinal
+    );
+
     const words =
       this.splitWords(
         cleanFinal
       );
 
+    let index = 0;
+
     /*
-     * A shorter FINAL cannot use consumedWords from the previous
-     * native Sherpa utterance.
+     * Split only AFTER Sherpa FINAL. This keeps long committed
+     * subtitles manageable without ever cutting an active rolling
+     * Sherpa hypothesis.
      */
-    if (
-      this.consumedWords > 0 &&
-      words.length < this.consumedWords
-    ) {
-      this.translationLog(
-        'FINAL_NEW_UTTERANCE_DETECTED',
-        {
-          finalText: cleanFinal,
-          words: words.length,
-          previousConsumedWords:
-            this.consumedWords
-        }
-      );
-
-      this.resetChunkStateForNewUtterance();
-    }
-
-    if (
-      words.length <=
-      this.consumedWords
-    ) {
-      this.resetSherpaSegment();
-      return;
-    }
-
-    let remaining =
-      words.slice(
-        this.consumedWords
-      );
-
-    while (
-      remaining.length > 0
-    ) {
+    while (index < words.length) {
 
       const chunkWords: string[] = [];
 
-      for (const word of remaining) {
+      while (index < words.length) {
 
-        chunkWords.push(word);
+        const word =
+          words[index];
 
         const candidate =
-          chunkWords.join(' ');
+          [...chunkWords, word].join(' ');
 
         if (
-          chunkWords.length >=
-          this.maxChunkWords ||
-          candidate.length >=
-          this.targetChunkChars
+          chunkWords.length > 0 &&
+          (
+            chunkWords.length >= this.maxChunkWords ||
+            candidate.length > this.targetChunkChars
+          )
+        ) {
+          break;
+        }
+
+        chunkWords.push(word);
+        index++;
+
+        if (
+          chunkWords.length >= this.maxChunkWords ||
+          chunkWords.join(' ').length >= this.targetChunkChars
         ) {
           break;
         }
@@ -1021,27 +841,14 @@ export class ConversationPageComponent
         break;
       }
 
-      this.showLiveChunk(
-        chunk
-      );
-
-      this.consumedWords +=
-        chunkWords.length;
-
-      remaining =
-        words.slice(
-          this.consumedWords
-        );
-
       void this.commitChunk(
         chunk,
-        remaining.length === 0
+        index >= words.length
       );
     }
 
     this.resetSherpaSegment();
   }
-
 
   private splitWords(
     text: string
