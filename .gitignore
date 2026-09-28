@@ -483,6 +483,8 @@ $RECYCLE.BIN/
 # Vim temporary swap files
 *.swp
 API/appsettings.json
+backend/API/appsettings.json
+backend/Api/appsettings.Development.json
 
 android/app/src/main/assets/models/mask2former.onnx
 

@@ -2,6 +2,8 @@ package io.ionic.starter
 
 import android.content.Context
 import android.util.Log
+import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
@@ -48,6 +50,28 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
     private var totalSamples = 0L
     private var decodeCount = 0L
     private var resultCheckCount = 0L
+
+    // ============================================================
+    // REAL-TIME / BACKLOG DIAGNOSTICS
+    // ============================================================
+    //
+    // Each input chunk is 100 ms of 16 kHz PCM. We timestamp it
+    // BEFORE enqueueing it on the single Sherpa executor. When the
+    // executor eventually starts that task, enqueueDelayMs tells us
+    // exactly how far Sherpa has fallen behind real time.
+    //
+    // Diagnostic only: this does not alter PCM, endpointing,
+    // decoding, stream state, or recognition results.
+    private val timingLock = Any()
+    private var submittedChunkCount = 0L
+    private var completedChunkCount = 0L
+    private var queuedChunkCount = 0L
+    private var maxQueuedChunkCount = 0L
+    private var maxEnqueueDelayMs = 0.0
+    private var totalProcessingMs = 0.0
+    private var totalDecodeMs = 0.0
+    private var totalAcceptedAudioMs = 0.0
+    private var timingStartedNs = 0L
 
     // ============================================================
     // START
@@ -112,14 +136,40 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                                 joiner = joiner.absolutePath,
                             ),
                         tokens = tokens.absolutePath,
-                        numThreads = 2,
+                        numThreads = 4,
                         debug = false,
                         provider = "cpu",
+                    )
+
+                val endpointConfig =
+                    EndpointConfig(
+                        // Rule 1 fires even when no speech was decoded. The default 2.4 s
+                        // caused repeated empty endpoints during silence. Keep it only as
+                        // a long safety boundary; normal utterances are finalized by rule 2.
+                        rule1 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = 30.0f,
+                            minUtteranceLength = 0.0f,
+                        ),
+                        // After real speech has been decoded, allow a little more trailing
+                        // silence than the default. This gives 1-3 word utterances enough
+                        // time to become a stable hypothesis before reset.
+                        rule2 = EndpointRule(
+                            mustContainNonSilence = true,
+                            minTrailingSilence = 1.8f,
+                            minUtteranceLength = 0.0f,
+                        ),
+                        rule3 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = 0.0f,
+                            minUtteranceLength = 20.0f,
+                        ),
                     )
 
                 val config =
                     OnlineRecognizerConfig(
                         modelConfig = modelConfig,
+                        endpointConfig = endpointConfig,
                         enableEndpoint = true,
                         decodingMethod = "greedy_search",
                     )
@@ -144,6 +194,18 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 totalSamples = 0L
                 decodeCount = 0L
                 resultCheckCount = 0L
+
+                synchronized(timingLock) {
+                    submittedChunkCount = 0L
+                    completedChunkCount = 0L
+                    queuedChunkCount = 0L
+                    maxQueuedChunkCount = 0L
+                    maxEnqueueDelayMs = 0.0
+                    totalProcessingMs = 0.0
+                    totalDecodeMs = 0.0
+                    totalAcceptedAudioMs = 0.0
+                    timingStartedNs = System.nanoTime()
+                }
 
                 Log.i(
                     TAG,
@@ -183,8 +245,32 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         }
 
         val copy = bytes.copyOf()
+        val enqueuedNs = System.nanoTime()
+        val audioDurationMs = (copy.size / 2.0) * 1000.0 / SAMPLE_RATE
+
+        val submittedId: Long
+        val queueDepthAtSubmit: Long
+        synchronized(timingLock) {
+            submittedChunkCount++
+            submittedId = submittedChunkCount
+            queuedChunkCount++
+            queueDepthAtSubmit = queuedChunkCount
+            if (queuedChunkCount > maxQueuedChunkCount) {
+                maxQueuedChunkCount = queuedChunkCount
+            }
+        }
 
         executor.execute {
+            val taskStartedNs = System.nanoTime()
+            val enqueueDelayMs = (taskStartedNs - enqueuedNs) / 1_000_000.0
+            var decodeMs = 0.0
+            var decodedThisChunk = 0
+
+            synchronized(timingLock) {
+                if (enqueueDelayMs > maxEnqueueDelayMs) {
+                    maxEnqueueDelayMs = enqueueDelayMs
+                }
+            }
             if (!running) {
                 Log.w(TAG, "★★★★★ PCM DROPPED IN EXECUTOR: stopped ★★★★★")
                 return@execute
@@ -274,7 +360,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 // DECODE EVERYTHING CURRENTLY READY
                 // ------------------------------------------------
 
-                var decodedThisChunk = 0
+                val decodeStartedNs = System.nanoTime()
 
                 while (r.isReady(s)) {
 
@@ -283,6 +369,8 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     decodeCount++
                     decodedThisChunk++
                 }
+
+                decodeMs = (System.nanoTime() - decodeStartedNs) / 1_000_000.0
 
                 if (pcmChunkCount <= 10L || pcmChunkCount % 10L == 0L || decodedThisChunk > 0) {
 
@@ -337,17 +425,19 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                     Log.i(TAG, "★★★★★ ENDPOINT DETECTED text='$text' ★★★★★")
 
-                    if (text.isNotEmpty()) {
-
-                        Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
-
-                        listener.onSherpaFinal(text, language)
+                    // Never destroy the active stream on an empty endpoint. With short
+                    // utterances the acoustic model may need another decode cycle before
+                    // text becomes available. Reset only after we have an actual result.
+                    if (text.isEmpty()) {
+                        Log.i(TAG, "★★★★★ EMPTY ENDPOINT IGNORED - STREAM KEPT ALIVE ★★★★★")
+                        return@execute
                     }
 
+                    Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
+                    listener.onSherpaFinal(text, language)
+
                     r.reset(s)
-
                     s.setOption("language", language)
-
                     lastText = ""
 
                     Log.i(TAG, "★★★★★ STREAM RESET language=$language ★★★★★")
@@ -357,6 +447,66 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 Log.e(TAG, "★★★★★ SHERPA DECODE FAILED: ${e.message} ★★★★★", e)
 
                 listener.onSherpaError(e.message ?: "Sherpa decode failed")
+            } finally {
+                val processingMs = (System.nanoTime() - taskStartedNs) / 1_000_000.0
+
+                val completed: Long
+                val queueRemaining: Long
+                val maxQueue: Long
+                val maxDelay: Double
+                val avgProcessing: Double
+                val avgDecode: Double
+                val realtimeFactor: Double
+                val totalAudio: Double
+
+                synchronized(timingLock) {
+                    completedChunkCount++
+                    if (queuedChunkCount > 0L) {
+                        queuedChunkCount--
+                    }
+                    totalProcessingMs += processingMs
+                    totalDecodeMs += decodeMs
+                    totalAcceptedAudioMs += audioDurationMs
+
+                    completed = completedChunkCount
+                    queueRemaining = queuedChunkCount
+                    maxQueue = maxQueuedChunkCount
+                    maxDelay = maxEnqueueDelayMs
+                    avgProcessing =
+                        if (completedChunkCount > 0L) totalProcessingMs / completedChunkCount else 0.0
+                    avgDecode =
+                        if (completedChunkCount > 0L) totalDecodeMs / completedChunkCount else 0.0
+                    totalAudio = totalAcceptedAudioMs
+                    realtimeFactor =
+                        if (totalAcceptedAudioMs > 0.0) totalProcessingMs / totalAcceptedAudioMs else 0.0
+                }
+
+                if (
+                    submittedId <= 20L ||
+                    submittedId % 10L == 0L ||
+                    enqueueDelayMs >= 100.0 ||
+                    processingMs >= audioDurationMs ||
+                    queueDepthAtSubmit > 2L
+                ) {
+                    Log.i(
+                        TAG,
+                        "★★★★★ SHERPA_SPEED " +
+                            "chunk=$submittedId " +
+                            "audioMs=${"%.1f".format(audioDurationMs)} " +
+                            "enqueueDelayMs=${"%.1f".format(enqueueDelayMs)} " +
+                            "processMs=${"%.1f".format(processingMs)} " +
+                            "decodeMs=${"%.1f".format(decodeMs)} " +
+                            "decoded=$decodedThisChunk " +
+                            "queueAtSubmit=$queueDepthAtSubmit " +
+                            "queueRemaining=$queueRemaining " +
+                            "maxQueue=$maxQueue " +
+                            "maxDelayMs=${"%.1f".format(maxDelay)} " +
+                            "avgProcessMs=${"%.1f".format(avgProcessing)} " +
+                            "avgDecodeMs=${"%.1f".format(avgDecode)} " +
+                            "totalAudioMs=${"%.1f".format(totalAudio)} " +
+                            "RTF=${"%.3f".format(realtimeFactor)} ★★★★★",
+                    )
+                }
             }
         }
     }

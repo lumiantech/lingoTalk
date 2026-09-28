@@ -14,7 +14,6 @@ import android.speech.RecognitionListener
 import android.speech.RecognitionService
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
-import android.util.Base64
 import android.util.Log
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -25,6 +24,7 @@ import java.util.concurrent.Executors
 
 @CapacitorPlugin(name = "SpeechRecognition")
 class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
+
     companion object {
         private const val TAG = "LingoSpeech"
         private const val SERVICE_TEST_DELAY_MS = 1500L
@@ -56,45 +56,141 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         )
 
     private val modelInstallerExecutor = Executors.newSingleThreadExecutor()
+
     private val handler = Handler(Looper.getMainLooper())
+
     private val restartRunnable = Runnable { startGoogleRecognizer() }
+
     private var speechRecognizer: SpeechRecognizer? = null
+
     private var sherpa: SherpaStreamingRecognizer? = null
+
     private var keepListening = false
+
     private var language = "hr-HR"
+
     private var sherpaActive = false
+
     private var currentServiceIndex = 0
+
     private var testingRecognitionServices = false
+
     private var selectedWorkingService: RecognitionServiceCandidate? = null
+
     private var serviceTestRunnable: Runnable? = null
 
-    override fun load() {
-        sherpa = SherpaStreamingRecognizer(context, this)
+    /*
+     * =========================================================
+     * WEBRTC PCM -> SHERPA
+     * =========================================================
+     *
+     * WebRTC is now the ONLY microphone owner.
+     *
+     * Native WebRTC:
+     *
+     * microphone
+     *    |
+     *    +----> WebRTC call
+     *    |
+     *    +----> NativePcmBus
+     *                |
+     *                v
+     *        SherpaPcmAccumulator
+     *                |
+     *                v
+     *             Sherpa
+     *
+     * Sherpa itself NEVER opens AudioRecord.
+     */
+
+    private val sherpaPcmAccumulator = SherpaPcmAccumulator { pcm ->
+        if (sherpaActive) {
+
+            sherpa?.acceptPcm16(pcm)
+        }
     }
+
+    private val pcmListener =
+        object : NativePcmBus.Listener {
+
+            override fun onPcm16k(pcm: ByteArray) {
+
+                if (!sherpaActive) {
+                    return
+                }
+
+                sherpaPcmAccumulator.write(pcm)
+            }
+        }
+
+    /*
+     * =========================================================
+     * PLUGIN LOAD
+     * =========================================================
+     */
+
+    override fun load() {
+
+        sherpa = SherpaStreamingRecognizer(context, this)
+
+        /*
+         * We only subscribe to PCM.
+         *
+         * NO microphone is opened here.
+         */
+        NativePcmBus.setListener(pcmListener)
+
+        Log.i(TAG, "SpeechRecognition loaded - waiting for WebRTC PCM")
+    }
+
+    /*
+     * =========================================================
+     * CAPABILITIES
+     * =========================================================
+     */
 
     @PluginMethod
     fun getCapabilities(call: PluginCall) {
+
         call.resolve(
             JSObject().apply {
                 put("androidApi", Build.VERSION.SDK_INT)
+
                 put("androidVersion", Build.VERSION.RELEASE)
+
                 put("audioInjectionMode", getAudioInjectionMode())
+
                 put("supportsSharedAudio", Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+
                 put("sherpaFallback", true)
+
+                /*
+                 * Important diagnostic information.
+                 */
+                put("microphoneOwner", "webrtc")
             }
         )
     }
+
+    /*
+     * =========================================================
+     * OFFLINE MODEL
+     * =========================================================
+     */
 
     @PluginMethod
     fun prepareOfflineModel(call: PluginCall) {
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+
             call.resolve(
                 JSObject().apply {
                     put("installed", false)
+
                     put("required", false)
                 }
             )
+
             return
         }
 
@@ -105,6 +201,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
             call.resolve(
                 JSObject().apply {
                     put("installed", true)
+
                     put("required", true)
                 }
             )
@@ -135,6 +232,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                 call.resolve(
                     JSObject().apply {
                         put("installed", true)
+
                         put("required", true)
                     }
                 )
@@ -148,6 +246,7 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                     "error",
                     JSObject().apply {
                         put("engine", "sherpa")
+
                         put("message", e.message ?: "Offline model installation failed")
                     },
                 )
@@ -157,100 +256,194 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         }
     }
 
+    /*
+     * =========================================================
+     * START
+     * =========================================================
+     */
+
     @PluginMethod
     fun start(call: PluginCall) {
+
         language = call.getString("language", "hr-HR") ?: "hr-HR"
+
         keepListening = true
+
         Log.i(TAG, "START language=$language api=${Build.VERSION.SDK_INT}")
+
         activity.runOnUiThread {
             logRecognitionServices()
+
             if (Build.VERSION.SDK_INT in Build.VERSION_CODES.S until Build.VERSION_CODES.TIRAMISU) {
-                // Android 12/12L: Sherpa is the reliable PCM path. Google URI injection remains in
-                // parallel as a diagnostic/bonus path.
+
+                /*
+                 * Android 12 / 12L
+                 *
+                 * Sherpa is the reliable path.
+                 *
+                 * IMPORTANT:
+                 * Sherpa does NOT start a microphone.
+                 * It waits for WebRTC PCM.
+                 */
+
                 startSherpa()
+
+                /*
+                 * Keep existing Google injected-audio path
+                 * as the secondary/diagnostic path.
+                 *
+                 * It receives the SAME WebRTC PCM through
+                 * SharedAudioStream.
+                 */
+
                 if (selectedWorkingService != null) {
+
                     createRecognizerForService(selectedWorkingService!!)
+
                     startGoogleRecognizer()
                 } else {
+
                     startRecognitionServiceTest()
                 }
             } else {
-                // Android 13+: Google EXTRA_AUDIO_SOURCE first. Sherpa starts only if Google fails.
+
+                /*
+                 * Android 13+
+                 *
+                 * Google injected PCM first.
+                 * Sherpa remains fallback.
+                 */
+
                 ensureRecognizer()
+
                 startGoogleRecognizer()
             }
+
             call.resolve()
         }
     }
+
+    /*
+     * =========================================================
+     * STOP
+     * =========================================================
+     */
 
     @PluginMethod
     fun stop(call: PluginCall) {
+
         keepListening = false
+
         testingRecognitionServices = false
+
         handler.removeCallbacks(restartRunnable)
+
         cancelServiceTestTimer()
+
+        /*
+         * Stop accepting WebRTC PCM into Sherpa.
+         */
         sherpaActive = false
+
+        sherpaPcmAccumulator.reset()
+
         sherpa?.stop()
+
         activity.runOnUiThread {
             try {
+
                 speechRecognizer?.stopListening()
             } catch (_: Exception) {}
+
             try {
+
                 speechRecognizer?.cancel()
             } catch (_: Exception) {}
+
             destroyCurrentRecognizer()
+
             SharedAudioStream.close()
+
             sendState("stopped", "none")
+
             call.resolve()
         }
     }
 
-    @PluginMethod
-    fun pushAudio(call: PluginCall) {
-        val base64 = call.getString("data") ?: return call.reject("Missing audio data")
-        try {
-            val bytes = Base64.decode(base64, Base64.NO_WRAP)
-            if (sherpaActive) sherpa?.acceptPcm16(bytes)
-            // Writes only when Google/provider has actually opened the pipe; otherwise
-            // SharedAudioStream safely drops it.
-            SharedAudioStream.write(bytes)
-            call.resolve()
-        } catch (e: Exception) {
-            Log.e(TAG, "pushAudio failed", e)
-            call.reject("Failed to push audio", e)
-        }
-    }
+    /*
+     * =========================================================
+     * SHERPA
+     * =========================================================
+     */
 
     private fun startSherpa() {
-        if (sherpaActive) return
+
+        if (sherpaActive) {
+            return
+        }
+
+        /*
+         * Start with an empty PCM chunk.
+         */
+        sherpaPcmAccumulator.reset()
+
         sherpaActive = true
+
         sendState("sherpa_starting", "sherpa")
+
+        Log.i(TAG, "Starting Sherpa - PCM source is WebRTC")
+
         sherpa?.start(language)
     }
 
     override fun onSherpaReady(language: String) {
+
+        /*
+         * DO NOT start AudioRecord here.
+         *
+         * WebRTC already owns the microphone.
+         */
+
+        Log.i(TAG, "★★★★★ SHERPA READY - WAITING FOR WEBRTC PCM ★★★★★")
+
+        sherpaPcmAccumulator.reset()
+
         sendState("ready", "sherpa")
     }
 
     override fun onSherpaPartial(text: String, language: String) {
+
         emitResult("partialResult", text, "sherpa", language, false)
     }
 
     override fun onSherpaFinal(text: String, language: String) {
+
         emitResult("finalResult", text, "sherpa", language, true)
     }
 
     override fun onSherpaError(message: String) {
+
         sherpaActive = false
+
+        sherpaPcmAccumulator.reset()
+
         notifyListeners(
             "error",
             JSObject().apply {
                 put("engine", "sherpa")
+
                 put("message", message)
             },
         )
+
         sendState("sherpa_unavailable", "sherpa")
     }
+
+    /*
+     * =========================================================
+     * RESULT
+     * =========================================================
+     */
 
     private fun emitResult(
         event: String,
@@ -259,133 +452,240 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
         resultLanguage: String,
         isFinal: Boolean,
     ) {
-        if (text.isBlank()) return
+
+        if (text.isBlank()) {
+            return
+        }
+
         notifyListeners(
             event,
             JSObject().apply {
                 put("text", text)
+
                 put("engine", engine)
+
                 put("language", resultLanguage)
+
                 put("isFinal", isFinal)
             },
         )
     }
 
+    /*
+     * =========================================================
+     * ANDROID 12 RECOGNITION SERVICE TEST
+     * =========================================================
+     */
+
     private fun startRecognitionServiceTest() {
-        if (!keepListening) return
+
+        if (!keepListening) {
+            return
+        }
+
         testingRecognitionServices = true
+
         currentServiceIndex = 0
+
         Log.i(TAG, "Starting API31/32 RecognitionService pipe test")
+
         testCurrentRecognitionService()
     }
 
     private fun testCurrentRecognitionService() {
-        if (!keepListening || !testingRecognitionServices) return
+
+        if (!keepListening || !testingRecognitionServices) {
+            return
+        }
+
         if (currentServiceIndex >= android12RecognitionServices.size) {
+
             testingRecognitionServices = false
+
             sendState("recognition_service_test_failed", "google")
+
             Log.w(
                 TAG,
                 "No API31/32 RecognitionService opened the shared-audio pipe; Sherpa remains active",
             )
+
             return
         }
+
         val candidate = android12RecognitionServices[currentServiceIndex]
+
         cancelServiceTestTimer()
+
         destroyCurrentRecognizer()
+
         SharedAudioStream.close()
+
         createRecognizerForService(candidate)
-        if (speechRecognizer == null) return moveToNextRecognitionService()
+
+        if (speechRecognizer == null) {
+
+            moveToNextRecognitionService()
+
+            return
+        }
+
         startGoogleRecognizer()
+
         serviceTestRunnable =
             Runnable { checkCurrentRecognitionService() }
                 .also { handler.postDelayed(it, SERVICE_TEST_DELAY_MS) }
     }
 
     private fun checkCurrentRecognitionService() {
+
         serviceTestRunnable = null
-        if (!keepListening || !testingRecognitionServices) return
+
+        if (!keepListening || !testingRecognitionServices) {
+            return
+        }
+
         val candidate = android12RecognitionServices.getOrNull(currentServiceIndex) ?: return
+
         if (SharedAudioStream.isOpen()) {
+
             selectedWorkingService = candidate
+
             testingRecognitionServices = false
+
             Log.i(TAG, "API31/32 service ${candidate.label} opened audio pipe")
+
             sendState("recognition_service_selected", "google")
         } else {
+
             Log.w(TAG, "API31/32 service ${candidate.label} did not open audio pipe")
+
             moveToNextRecognitionService()
         }
     }
 
     private fun moveToNextRecognitionService() {
+
         cancelServiceTestTimer()
+
         try {
+
             speechRecognizer?.cancel()
         } catch (_: Exception) {}
+
         destroyCurrentRecognizer()
+
         SharedAudioStream.close()
+
         currentServiceIndex++
+
         handler.postDelayed({ testCurrentRecognitionService() }, 300L)
     }
 
     private fun cancelServiceTestTimer() {
+
         serviceTestRunnable?.let(handler::removeCallbacks)
+
         serviceTestRunnable = null
     }
 
+    /*
+     * =========================================================
+     * GOOGLE RECOGNIZER
+     * =========================================================
+     */
+
     private fun createRecognizerForService(candidate: RecognitionServiceCandidate) {
+
         try {
+
             val component = ComponentName(candidate.packageName, candidate.className)
+
             speechRecognizer =
                 SpeechRecognizer.createSpeechRecognizer(context, component).also {
                     it.setRecognitionListener(recognitionListener)
                 }
         } catch (e: Exception) {
+
             Log.e(TAG, "Failed to create ${candidate.label}", e)
+
             speechRecognizer = null
         }
     }
 
     private fun ensureRecognizer() {
-        if (speechRecognizer != null) return
+
+        if (speechRecognizer != null) {
+            return
+        }
+
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
+
             notifyListeners(
                 "error",
                 JSObject().apply {
                     put("engine", "google")
+
                     put("message", "Speech recognition is not available")
                 },
             )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+                startSherpa()
+            }
+
             return
         }
+
         try {
+
             speechRecognizer =
                 SpeechRecognizer.createSpeechRecognizer(context).also {
                     it.setRecognitionListener(recognitionListener)
                 }
         } catch (e: Exception) {
+
             Log.e(TAG, "Failed to create SpeechRecognizer", e)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+                startSherpa()
+            }
         }
     }
 
+    /*
+     * =========================================================
+     * SHARED WEBRTC PCM -> GOOGLE
+     * =========================================================
+     */
+
     private fun configureSharedAudio(intent: Intent) {
+
         when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+
                 val audioSource = SharedAudioStream.createPipe()
+
                 intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, audioSource)
+
                 intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1)
+
                 intent.putExtra(
                     RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING,
                     AudioFormat.ENCODING_PCM_16BIT,
                 )
+
                 intent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000)
             }
+
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+
                 val uri = Uri.parse("content://${context.packageName}.speech.audio/live")
+
                 @Suppress("DEPRECATION")
                 intent.putExtra(RecognizerIntent.EXTRA_AUDIO_INJECT_SOURCE, uri)
+
                 intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
         }
@@ -393,110 +693,201 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
 
     private val recognitionListener =
         object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) = sendState("ready", "google")
 
-            override fun onBeginningOfSpeech() = sendState("speaking", "google")
+            override fun onReadyForSpeech(params: Bundle?) {
+
+                sendState("ready", "google")
+            }
+
+            override fun onBeginningOfSpeech() {
+
+                sendState("speaking", "google")
+            }
 
             override fun onRmsChanged(rmsdB: Float) {}
 
             override fun onBufferReceived(buffer: ByteArray?) {}
 
-            override fun onEndOfSpeech() = sendState("processing", "google")
+            override fun onEndOfSpeech() {
+
+                sendState("processing", "google")
+            }
 
             override fun onError(error: Int) {
+
                 Log.w(TAG, "Google error $error: ${errorMessage(error)}")
+
                 notifyListeners(
                     "error",
                     JSObject().apply {
                         put("engine", "google")
+
                         put("code", error)
+
                         put("message", errorMessage(error))
                     },
                 )
-                if (!keepListening || testingRecognitionServices) return
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    // Once API33+ Google fails, keep the same WebRTC PCM source and move to Sherpa.
-                    try {
-                        speechRecognizer?.cancel()
-                    } catch (_: Exception) {}
-                    destroyCurrentRecognizer()
-                    SharedAudioStream.close()
-                    startSherpa()
+                if (!keepListening || testingRecognitionServices) {
                     return
                 }
-                restartAfter(if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1000L else 300L)
+
+                /*
+                 * Android 13+
+                 *
+                 * Google failed.
+                 * Sherpa takes over.
+                 *
+                 * Still the SAME WebRTC PCM source.
+                 */
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+                    try {
+
+                        speechRecognizer?.cancel()
+                    } catch (_: Exception) {}
+
+                    destroyCurrentRecognizer()
+
+                    SharedAudioStream.close()
+
+                    startSherpa()
+
+                    return
+                }
+
+                restartAfter(
+                    if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+
+                        1000L
+                    } else {
+
+                        300L
+                    }
+                )
             }
 
             override fun onResults(results: Bundle?) {
+
                 val text =
                     results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                if (text.isNotBlank()) emitResult("finalResult", text, "google", language, true)
-                if (keepListening && !testingRecognitionServices && !sherpaActive)
+
+                if (text.isNotBlank()) {
+
+                    emitResult("finalResult", text, "google", language, true)
+                }
+
+                if (keepListening && !testingRecognitionServices && !sherpaActive) {
+
                     restartAfter(250L)
+                }
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+
                 val text =
                     partialResults
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         .orEmpty()
-                if (text.isNotBlank()) emitResult("partialResult", text, "google", language, false)
+
+                if (text.isNotBlank()) {
+
+                    emitResult("partialResult", text, "google", language, false)
+                }
             }
 
             override fun onEvent(eventType: Int, params: Bundle?) {}
         }
 
     private fun startGoogleRecognizer() {
-        if (!keepListening) return
+
+        if (!keepListening) {
+            return
+        }
+
         val recognizer = speechRecognizer ?: return
+
         handler.removeCallbacks(restartRunnable)
+
         val intent =
             Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
                 )
-                if (!language.equals("auto", true))
+
+                if (!language.equals("auto", true)) {
+
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, language)
+                }
+
                 putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             }
+
         configureSharedAudio(intent)
+
         try {
+
             recognizer.startListening(intent)
         } catch (e: Exception) {
+
             Log.e(TAG, "Google startListening failed", e)
-            if (testingRecognitionServices) moveToNextRecognitionService()
-            else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) startSherpa()
-            else restartAfter(1000L)
+
+            if (testingRecognitionServices) {
+
+                moveToNextRecognitionService()
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
+                startSherpa()
+            } else {
+
+                restartAfter(1000L)
+            }
         }
     }
 
     private fun restartAfter(ms: Long) {
+
         handler.removeCallbacks(restartRunnable)
+
         handler.postDelayed(restartRunnable, ms)
     }
 
     private fun destroyCurrentRecognizer() {
+
         try {
+
             speechRecognizer?.cancel()
         } catch (_: Exception) {}
+
         try {
+
             speechRecognizer?.destroy()
         } catch (_: Exception) {}
+
         speechRecognizer = null
     }
 
+    /*
+     * =========================================================
+     * STATE
+     * =========================================================
+     */
+
     private fun sendState(state: String, engine: String) {
+
         notifyListeners(
             "stateChanged",
             JSObject().apply {
                 put("state", state)
+
                 put("engine", engine)
             },
         )
@@ -505,32 +896,55 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
     private fun errorMessage(error: Int) =
         when (error) {
             SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
+
             SpeechRecognizer.ERROR_CLIENT -> "Client error"
+
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission missing"
+
             SpeechRecognizer.ERROR_NETWORK -> "Network error"
+
             SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+
             SpeechRecognizer.ERROR_NO_MATCH -> "No speech match"
+
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer busy"
+
             SpeechRecognizer.ERROR_SERVER -> "Speech recognition server error"
+
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected"
+
             else -> "Speech recognition error $error"
         }
 
     private fun getAudioInjectionMode() =
         when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> "AUDIO_SOURCE_API_33"
+
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> "AUDIO_INJECT_SOURCE_API_31"
+
             else -> "UNSUPPORTED"
         }
 
+    /*
+     * =========================================================
+     * DEBUG RECOGNITION SERVICES
+     * =========================================================
+     */
+
     private fun logRecognitionServices() {
+
         try {
+
             val defaultService =
                 Settings.Secure.getString(context.contentResolver, "voice_recognition_service")
+
             Log.d(TAG, "Default recognition service=${defaultService ?: "NONE"}")
+
             val intent = Intent(RecognitionService.SERVICE_INTERFACE)
+
             val services =
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+
                     context.packageManager.queryIntentServices(
                         intent,
                         PackageManager.ResolveInfoFlags.of(
@@ -538,12 +952,14 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                         ),
                     )
                 } else {
+
                     @Suppress("DEPRECATION")
                     context.packageManager.queryIntentServices(
                         intent,
                         PackageManager.MATCH_DEFAULT_ONLY,
                     )
                 }
+
             services.forEach {
                 Log.d(
                     TAG,
@@ -551,20 +967,49 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
                 )
             }
         } catch (e: Exception) {
+
             Log.e(TAG, "Failed to query recognition services", e)
         }
     }
 
+    /*
+     * =========================================================
+     * DESTROY
+     * =========================================================
+     */
+
     override fun handleOnDestroy() {
+
         keepListening = false
+
         testingRecognitionServices = false
+
         handler.removeCallbacks(restartRunnable)
+
         cancelServiceTestTimer()
+
         destroyCurrentRecognizer()
+
         SharedAudioStream.close()
+
+        sherpaActive = false
+
+        sherpaPcmAccumulator.reset()
+
+        /*
+         * Remove our PCM subscription.
+         *
+         * Native WebRTC itself is released by
+         * NativeWebRtcPlugin / NativeWebRtc engine.
+         */
+        NativePcmBus.setListener(null)
+
         sherpa?.release()
+
         sherpa = null
+
         modelInstallerExecutor.shutdownNow()
+
         super.handleOnDestroy()
     }
 }
