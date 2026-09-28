@@ -20,6 +20,8 @@ class MainActivity : BridgeActivity() {
 
         registerPlugin(OfflineTranslationPlugin::class.java)
 
+        registerPlugin(NativeWebRtcPlugin::class.java)
+
         super.onCreate(savedInstanceState)
 
         bridge.webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW

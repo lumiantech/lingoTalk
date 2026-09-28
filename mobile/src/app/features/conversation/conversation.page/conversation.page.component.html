@@ -1,5 +1,13 @@
-<ion-content [fullscreen]="true" class="conversation-content">
-  <div class="lingo-shell" [class.theme-indigo]="colorTheme() === 'indigo'">
+<ion-content
+  [fullscreen]="true"
+  class="conversation-content"
+  [class.native-call-content]="nativeAndroid && webRtc.callConnected()"
+>
+  <div
+    class="lingo-shell"
+    [class.theme-indigo]="colorTheme() === 'indigo'"
+    [class.native-call-active]="nativeAndroid && webRtc.callConnected()"
+  >
 
     @if (!webRtc.callConnected()) {
     <div class="chat-screen">
@@ -178,86 +186,158 @@
         </button>
       </header>
 
-      <div class="video-stage">
+      <div class="video-stage" [class.native-video-stage]="nativeAndroid">
+
+        @if (nativeAndroid) {
+
+        <!--
+      These are layout anchors only.
+
+      Kotlin SurfaceViewRenderers render at exactly
+      these screen coordinates.
+    -->
+
+        <div #nativeRemoteVideo class="native-remote-video-slot">
+        </div>
+
+        <div #nativeLocalVideo class="native-local-video-slot">
+        </div>
+
+        } @else {
+
+        <!-- Browser / Chrome WebRTC -->
+
         <video #remoteVideo class="remote-video" autoplay playsinline>
         </video>
 
-        @if (!webRtc.remoteMediaStream()) {
+        <video #localVideo class="local-video" autoplay muted playsinline>
+        </video>
+        }
+
+
+        @if (
+        nativeAndroid
+        ? !webRtc.nativeRemoteVideoAvailable()
+        : !webRtc.remoteMediaStream()
+        ) {
+
         <div class="remote-placeholder">
-          <div class="call-avatar">L</div>
-          <div>Connecting…</div>
+
+          <div class="call-avatar">
+            L
+          </div>
+
+          <div>
+            Connecting…
+          </div>
+
         </div>
         }
 
+
         <div class="call-language-pill">
+
           {{ selectedLanguage }}
+
           →
+
           {{ remoteLanguage() ?? '...' }}
+
         </div>
 
-        <video #localVideo class="local-video" autoplay muted playsinline>
-        </video>
 
         @if (subtitlesVisible()) {
+
         @if (
         liveSttText() ||
         liveLocalTranslation() ||
         liveAiTranslation() ||
         liveAiPending()
         ) {
+
         <div class="live-translation-card">
 
           @if (liveSttText()) {
+
           <div class="live-translation-row">
-            <span class="live-translation-label">STT</span>
+
+            <span class="live-translation-label">
+              STT
+            </span>
+
             <span class="live-stt-text">
               {{ liveSttText() }}
             </span>
+
           </div>
           }
 
+
           @if (liveLocalTranslation()) {
+
           <div class="live-translation-row">
-            <span class="live-translation-label">LOCAL</span>
+
+            <span class="live-translation-label">
+              LOCAL
+            </span>
+
             <span class="live-local-translation">
               {{ liveLocalTranslation() }}
             </span>
+
           </div>
           }
+
 
           @if (
           liveAiOriginal() ||
           liveAiTranslation() ||
           liveAiPending()
           ) {
-          <div class="live-ai-separator"></div>
+
+          <div class="live-ai-separator">
+          </div>
+
 
           <div class="live-translation-row">
-            <span class="live-translation-label">AI</span>
+
+            <span class="live-translation-label">
+              AI
+            </span>
+
 
             <div class="live-ai-copy">
+
               @if (liveAiOriginal()) {
+
               <div class="ai-corrected-original">
                 {{ liveAiOriginal() }}
               </div>
               }
 
+
               @if (liveAiTranslation()) {
+
               <div class="ai-translated">
                 {{ liveAiTranslation() }}
               </div>
+
               } @else if (liveAiPending()) {
+
               <div class="ai-pending">
                 Translating…
               </div>
               }
+
             </div>
+
           </div>
           }
 
         </div>
         }
         }
+
       </div>
 
       <div class="primary-call-controls">

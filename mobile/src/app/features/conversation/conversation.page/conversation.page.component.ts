@@ -1,6 +1,7 @@
 
 import { CommonModule } from '@angular/common';
 import {
+  AfterViewInit,
   Component,
   effect,
   ElementRef,
@@ -26,7 +27,7 @@ import {
   IonToolbar
 } from '@ionic/angular';
 
-import { Capacitor } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 
 
 
@@ -54,6 +55,20 @@ interface ConversationMessage {
   direction: 'sent' | 'received';
 }
 
+interface NativeWebRtcSubtitleBridge {
+  setSubtitleOverlay(options: {
+    originalText: string;
+    localTranslation: string;
+    aiTranslation: string;
+    aiPending: boolean;
+    visible: boolean;
+  }): Promise<void>;
+}
+
+const NativeWebRtcSubtitle =
+  registerPlugin<NativeWebRtcSubtitleBridge>('NativeWebRtc');
+
+
 
 @Component({
   selector: 'app-conversation',
@@ -80,7 +95,7 @@ interface ConversationMessage {
   ]
 })
 export class ConversationPageComponent
-  implements OnDestroy {
+  implements AfterViewInit, OnDestroy {
 
   @ViewChild('localVideo')
   private localVideo?:
@@ -91,12 +106,53 @@ export class ConversationPageComponent
     ElementRef<HTMLVideoElement>;
 
 
+  /*
+   * Android native WebRTC renderer placeholders.
+   *
+   * These elements do NOT render video themselves.
+   * Their DOM bounds tell Kotlin where native
+   * SurfaceViewRenderer views belong.
+   */
+
+  @ViewChild('nativeRemoteVideo')
+  private nativeRemoteVideo?:
+    ElementRef<HTMLDivElement>;
+
+  @ViewChild('nativeLocalVideo')
+  private nativeLocalVideo?:
+    ElementRef<HTMLDivElement>;
+
+  readonly nativeAndroid =
+    Capacitor.isNativePlatform() &&
+    Capacitor.getPlatform() === 'android';
+
   private readonly signalR =
     inject(TranslationSignalRService);
 
   private readonly offlineTranslation =
     inject(OfflineTranslationService);
 
+  private nativeVideoResizeObserver?:
+    ResizeObserver;
+
+  private nativeVideoLayoutFrame:
+    number | null = null;
+
+  private nativeVideoLayoutActive =
+    false;
+
+
+  private readonly nativeVideoWindowChanged =
+    () => {
+
+      this.scheduleNativeVideoLayout();
+    };
+
+  private readonly nativeVideoScrollChanged =
+    () => {
+
+      this.scheduleNativeVideoLayout();
+    };
 
   /*
    * Translation engine.
@@ -266,51 +322,95 @@ export class ConversationPageComponent
   constructor() {
 
     /*
+     * Android native video is composited above the Capacitor WebView.
+     * Therefore the live subtitle card must also be a native Android view.
+     * Angular remains the single source of truth for subtitle state.
+     */
+    effect(() => {
+      if (!this.nativeAndroid) {
+        return;
+      }
+
+      const originalText = this.liveSttText();
+      const localTranslation = this.liveLocalTranslation();
+      const aiTranslation = this.liveAiTranslation();
+      const aiPending = this.liveAiPending();
+      const visible = this.subtitlesVisible();
+
+      void NativeWebRtcSubtitle
+        .setSubtitleOverlay({
+          originalText,
+          localTranslation,
+          aiTranslation,
+          aiPending,
+          visible
+        })
+        .catch(error => {
+          console.error(
+            '★★★★★ NATIVE SUBTITLE OVERLAY FAILED ★★★★★',
+            error
+          );
+        });
+    });
+
+    /*
      * WebRTC connection controls STT.
      */
-    // effect(() => {
+    effect(() => {
 
-    //   const callConnected =
-    //     this.webRtc.callConnected();
+      const callConnected =
+        this.webRtc.callConnected();
 
-    //   console.log(
-    //     '★★★★★ CALL CONNECTED:',
-    //     callConnected,
-    //     '★★★★★'
-    //   );
 
-    //   if (callConnected) {
+      console.log(
+        '★★★★★ CALL CONNECTED:',
+        callConnected,
+        '★★★★★'
+      );
 
-    //     console.log(
-    //       '★★★★★ STARTING STT',
-    //       this.selectedLanguage,
-    //       '★★★★★'
-    //     );
 
-    //     void this.speech.start(
-    //       this.selectedLanguage
-    //     );
+      if (callConnected) {
 
-    //   } else {
+        console.log(
+          '★★★★★ STARTING STT',
+          this.selectedLanguage,
+          '★★★★★'
+        );
 
-    //     console.log(
-    //       '★★★★★ STOPPING STT ★★★★★'
-    //     );
 
-    //     void this.speech.stop();
-    //   }
-    // });
+        void this.speech.start(
+          this.selectedLanguage
+        );
 
-effect(() => {
 
-  console.log(
-    '★★★★★ A/B TEST A: SHERPA WITHOUT WEBRTC ★★★★★'
-  );
+        if (this.nativeAndroid) {
 
-  void this.speech.start(
-    this.selectedLanguage
-  );
-});
+          this.nativeVideoLayoutActive =
+            true;
+
+          this.scheduleNativeVideoLayout();
+        }
+
+      } else {
+
+        console.log(
+          '★★★★★ STOPPING STT ★★★★★'
+        );
+
+
+        void this.speech.stop();
+
+
+        if (this.nativeAndroid) {
+
+          this.nativeVideoLayoutActive =
+            false;
+
+          void this.webRtc
+            .hideNativeVideoRenderers();
+        }
+      }
+    });
     /*
      * Observe Sherpa partials.
      *
@@ -1234,7 +1334,15 @@ effect(() => {
       );
 
 
-    this.bindVideoStreams();
+    if (this.nativeAndroid) {
+
+      this.nativeVideoLayoutActive = true;
+
+      this.scheduleNativeVideoLayout();
+
+    } else {
+      this.bindVideoStreams();
+    }
   }
 
 
@@ -1281,17 +1389,38 @@ effect(() => {
   }
 
 
-  toggleMicrophone(): void {
-    const enabled = !this.microphoneEnabled();
-    this.microphoneEnabled.set(enabled);
-    this.webRtc.setMicrophoneEnabled(enabled);
+  async toggleMicrophone():
+    Promise<void> {
+
+    const enabled =
+      !this.microphoneEnabled();
+
+
+    this.microphoneEnabled.set(
+      enabled
+    );
+
+
+    await this.webRtc
+      .setMicrophoneEnabled(
+        enabled
+      );
   }
 
 
-  toggleCamera(): void {
+  async toggleCamera():
+    Promise<void> {
+
     const enabled = !this.cameraEnabled();
+
+
     this.cameraEnabled.set(enabled);
-    this.webRtc.setCameraEnabled(enabled);
+
+
+    await this.webRtc
+      .setCameraEnabled(
+        enabled
+      );
   }
 
 
@@ -1358,10 +1487,17 @@ effect(() => {
         true
       );
 
+    if (this.nativeAndroid) {
 
-    const offer =
-      await this.webRtc.createOffer();
+      this.nativeVideoLayoutActive =
+        true;
 
+
+      this.scheduleNativeVideoLayout();
+    }
+
+
+    const offer = await this.webRtc.createOffer();
 
     await this.signalR
       .sendWebRtcOffer(
@@ -1380,10 +1516,17 @@ effect(() => {
 
     this.lastObservedFinal = '';
 
-    this.subtitle.set(
-      null
-    );
+    this.subtitle.set(null);
 
+
+    this.nativeVideoLayoutActive = false;
+
+
+    if (this.nativeAndroid) {
+      await this.webRtc.hideNativeVideoRenderers();
+    }
+
+    await this.speech.stop();
 
     await this.webRtc.endCall();
   }
@@ -1399,6 +1542,37 @@ effect(() => {
   private bindVideoStreams():
     void {
 
+    /*
+     * =========================================================
+     * ANDROID
+     * =========================================================
+     *
+     * There is deliberately NO HTML MediaStream.
+     *
+     * NativeWebRtc owns the VideoTracks and Kotlin attaches
+     * them to SurfaceViewRenderer.
+     *
+     * Angular only supplies renderer bounds.
+     */
+
+    if (this.nativeAndroid) {
+
+      this.nativeVideoLayoutActive =
+        true;
+
+
+      this.scheduleNativeVideoLayout();
+
+      return;
+    }
+
+
+    /*
+     * =========================================================
+     * BROWSER / CHROME
+     * =========================================================
+     */
+
     const local =
       this.webRtc.localMediaStream();
 
@@ -1411,9 +1585,26 @@ effect(() => {
       this.localVideo
     ) {
 
-      this.localVideo
-        .nativeElement
-        .srcObject = local;
+      const element =
+        this.localVideo.nativeElement;
+
+
+      if (
+        element.srcObject !==
+        local
+      ) {
+
+        element.srcObject =
+          local;
+      }
+
+
+      void element
+        .play()
+        .catch(
+          () => {
+          }
+        );
     }
 
 
@@ -1422,9 +1613,26 @@ effect(() => {
       this.remoteVideo
     ) {
 
-      this.remoteVideo
-        .nativeElement
-        .srcObject = remote;
+      const element =
+        this.remoteVideo.nativeElement;
+
+
+      if (
+        element.srcObject !==
+        remote
+      ) {
+
+        element.srcObject =
+          remote;
+      }
+
+
+      void element
+        .play()
+        .catch(
+          () => {
+          }
+        );
     }
   }
 
@@ -1442,6 +1650,67 @@ effect(() => {
     this.cancelTranslationTimer();
 
 
+    this.nativeVideoLayoutActive =
+      false;
+
+
+    if (
+      this.nativeVideoLayoutFrame !==
+      null
+    ) {
+
+      cancelAnimationFrame(
+        this.nativeVideoLayoutFrame
+      );
+
+      this.nativeVideoLayoutFrame =
+        null;
+    }
+
+
+    this.nativeVideoResizeObserver
+      ?.disconnect();
+
+    this.nativeVideoResizeObserver =
+      undefined;
+
+
+    window.removeEventListener(
+      'resize',
+      this.nativeVideoWindowChanged
+    );
+
+
+    window.removeEventListener(
+      'orientationchange',
+      this.nativeVideoWindowChanged
+    );
+
+
+    window.removeEventListener(
+      'scroll',
+      this.nativeVideoScrollChanged,
+      true
+    );
+
+
+    /*
+     * Stop STT first.
+     *
+     * This removes Sherpa as PCM consumer.
+     */
+
+    await this.speech.stop();
+
+
+    /*
+     * Full release because the conversation page itself
+     * is being destroyed.
+     */
+
+    await this.webRtc.release();
+
+
     if (this.joined()) {
 
       await this.signalR
@@ -1454,7 +1723,70 @@ effect(() => {
     await this.signalR.disconnect();
   }
 
+  ngAfterViewInit():
+    void {
 
+    if (!this.nativeAndroid) {
+      return;
+    }
+
+
+    window.addEventListener(
+      'resize',
+      this.nativeVideoWindowChanged
+    );
+
+
+    window.addEventListener(
+      'orientationchange',
+      this.nativeVideoWindowChanged
+    );
+
+
+    window.addEventListener(
+      'scroll',
+      this.nativeVideoScrollChanged,
+      true
+    );
+
+
+    /*
+     * Ionic call screen / video stage can change size
+     * without a browser resize event.
+     */
+
+    this.nativeVideoResizeObserver =
+      new ResizeObserver(
+        () => {
+
+          this.scheduleNativeVideoLayout();
+        }
+      );
+
+
+    if (
+      this.nativeRemoteVideo
+    ) {
+
+      this.nativeVideoResizeObserver
+        .observe(
+          this.nativeRemoteVideo
+            .nativeElement
+        );
+    }
+
+
+    if (
+      this.nativeLocalVideo
+    ) {
+
+      this.nativeVideoResizeObserver
+        .observe(
+          this.nativeLocalVideo
+            .nativeElement
+        );
+    }
+  }
   /*
    * =========================================================
    * DEBUG
@@ -1476,6 +1808,117 @@ effect(() => {
       }),
       '★★★★★'
     );
+  }
+
+  private scheduleNativeVideoLayout():
+    void {
+
+    if (
+      !this.nativeAndroid ||
+      !this.nativeVideoLayoutActive
+    ) {
+
+      return;
+    }
+
+
+    if (
+      this.nativeVideoLayoutFrame !==
+      null
+    ) {
+
+      cancelAnimationFrame(
+        this.nativeVideoLayoutFrame
+      );
+    }
+
+
+    this.nativeVideoLayoutFrame =
+      requestAnimationFrame(
+        () => {
+
+          this.nativeVideoLayoutFrame =
+            null;
+
+
+          /*
+           * Wait one additional frame so Angular/Ionic has
+           * completed the current layout.
+           */
+
+          requestAnimationFrame(
+            () => {
+
+              void this
+                .updateNativeVideoLayout();
+            }
+          );
+        }
+      );
+  }
+
+
+  private async updateNativeVideoLayout():
+    Promise<void> {
+
+    if (
+      !this.nativeAndroid ||
+      !this.nativeVideoLayoutActive
+    ) {
+
+      return;
+    }
+
+
+    const remote =
+      this.nativeRemoteVideo
+        ?.nativeElement;
+
+    const local =
+      this.nativeLocalVideo
+        ?.nativeElement;
+
+
+    if (
+      !remote ||
+      !local
+    ) {
+
+      return;
+    }
+
+
+    /*
+     * If the call screen is currently display:none,
+     * getBoundingClientRect() will return zero bounds.
+     */
+
+    if (
+      remote.offsetWidth <= 0 ||
+      remote.offsetHeight <= 0
+    ) {
+
+      return;
+    }
+
+
+    try {
+
+      await this.webRtc
+        .setNativeVideoLayout(
+          remote,
+          local
+        );
+
+    } catch (
+    error
+    ) {
+
+      console.error(
+        '★★★★★ NATIVE VIDEO LAYOUT FAILED ★★★★★',
+        error
+      );
+    }
   }
 }
 
