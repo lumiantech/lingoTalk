@@ -2,6 +2,8 @@ package io.ionic.starter
 
 import android.content.Context
 import android.util.Log
+import com.k2fsa.sherpa.onnx.EndpointConfig
+import com.k2fsa.sherpa.onnx.EndpointRule
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineRecognizer
 import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
@@ -139,9 +141,35 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                         provider = "cpu",
                     )
 
+                val endpointConfig =
+                    EndpointConfig(
+                        // Rule 1 fires even when no speech was decoded. The default 2.4 s
+                        // caused repeated empty endpoints during silence. Keep it only as
+                        // a long safety boundary; normal utterances are finalized by rule 2.
+                        rule1 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = 30.0f,
+                            minUtteranceLength = 0.0f,
+                        ),
+                        // After real speech has been decoded, allow a little more trailing
+                        // silence than the default. This gives 1-3 word utterances enough
+                        // time to become a stable hypothesis before reset.
+                        rule2 = EndpointRule(
+                            mustContainNonSilence = true,
+                            minTrailingSilence = 1.8f,
+                            minUtteranceLength = 0.0f,
+                        ),
+                        rule3 = EndpointRule(
+                            mustContainNonSilence = false,
+                            minTrailingSilence = 0.0f,
+                            minUtteranceLength = 20.0f,
+                        ),
+                    )
+
                 val config =
                     OnlineRecognizerConfig(
                         modelConfig = modelConfig,
+                        endpointConfig = endpointConfig,
                         enableEndpoint = true,
                         decodingMethod = "greedy_search",
                     )
@@ -397,17 +425,19 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                     Log.i(TAG, "★★★★★ ENDPOINT DETECTED text='$text' ★★★★★")
 
-                    if (text.isNotEmpty()) {
-
-                        Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
-
-                        listener.onSherpaFinal(text, language)
+                    // Never destroy the active stream on an empty endpoint. With short
+                    // utterances the acoustic model may need another decode cycle before
+                    // text becomes available. Reset only after we have an actual result.
+                    if (text.isEmpty()) {
+                        Log.i(TAG, "★★★★★ EMPTY ENDPOINT IGNORED - STREAM KEPT ALIVE ★★★★★")
+                        return@execute
                     }
 
+                    Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
+                    listener.onSherpaFinal(text, language)
+
                     r.reset(s)
-
                     s.setOption("language", language)
-
                     lastText = ""
 
                     Log.i(TAG, "★★★★★ STREAM RESET language=$language ★★★★★")

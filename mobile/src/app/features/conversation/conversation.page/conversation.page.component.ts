@@ -44,10 +44,12 @@ import {
   WebRtcService
 } from '../../../core/services/web-rtc.service';
 
-import {
-  SpeechRecognitionService
-} from '../../../core/services/speech-recognition.service';
-import { SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
+// import {
+//   SpeechRecognitionService
+// } from '../../../core/services/speech-recognition.service';
+// import { ParticipantInfo, SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
+import { SpeechRecognitionService } from '../../../core/services/speech-recognition.service';
+import { ParticipantInfo, SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
 
 
 interface ConversationMessage {
@@ -126,8 +128,7 @@ export class ConversationPageComponent
     Capacitor.isNativePlatform() &&
     Capacitor.getPlatform() === 'android';
 
-  private readonly signalR =
-    inject(TranslationSignalRService);
+  private readonly signalR = inject(TranslationSignalRService);
 
   private readonly offlineTranslation =
     inject(OfflineTranslationService);
@@ -173,8 +174,7 @@ export class ConversationPageComponent
   readonly webRtc =
     inject(WebRtcService);
 
-  readonly speech =
-    inject(SpeechRecognitionService);
+  readonly speech =    inject(SpeechRecognitionService);
 
 
   readonly languages = [
@@ -204,11 +204,11 @@ export class ConversationPageComponent
 
   joined = signal(false);
 
-  remoteLanguage =
-    signal<string | null>(null);
+  remoteLanguage = signal<string | null>(null);
 
-  subtitle =
-    signal<SubtitleMessage | null>(null);
+  readonly remoteParticipant = signal<ParticipantInfo | null>(null);
+
+  subtitle = signal<SubtitleMessage | null>(null);
 
   /*
    * LIVE subtitle pipeline:
@@ -331,8 +331,19 @@ export class ConversationPageComponent
         return;
       }
 
-      const originalText = this.liveSttText();
-      const localTranslation = this.liveLocalTranslation();
+      const sttState = this.speech.state();
+      const sttInitializing =
+        this.webRtc.callConnected() &&
+        sttState !== 'ready' &&
+        sttState !== 'speaking' &&
+        sttState !== 'processing';
+
+      const originalText = sttInitializing
+        ? 'Pokretanje prepoznavanja govora…'
+        : this.liveSttText();
+      const localTranslation = sttInitializing
+        ? ''
+        : this.liveLocalTranslation();
       const aiTranslation = this.liveAiTranslation();
       const aiPending = this.liveAiPending();
       const visible = this.subtitlesVisible();
@@ -557,18 +568,16 @@ export class ConversationPageComponent
 
 
     this.signalR
-      .onParticipantLanguageChanged(
-        language => {
-
+      .onParticipantChanged(
+        participant => {
           console.log(
-            '★★★★★ REMOTE LANGUAGE:',
-            language,
+            '★★★★★ REMOTE PARTICIPANT:',
+            participant,
             '★★★★★'
           );
 
-          this.remoteLanguage.set(
-            language
-          );
+          this.remoteParticipant.set(participant);
+          this.remoteLanguage.set(participant.language);
         }
       );
 
@@ -577,9 +586,8 @@ export class ConversationPageComponent
       .onParticipantLeft(
         () => {
 
-          this.remoteLanguage.set(
-            null
-          );
+          this.remoteLanguage.set(null);
+          this.remoteParticipant.set(null);
         }
       );
 
@@ -594,16 +602,7 @@ export class ConversationPageComponent
     this.signalR
       .onSubtitleReceived(
         subtitle => {
-          // LOCAL from the other participant arrives immediately.
-          this.subtitle.set(subtitle);
-          this.latestDisplayedSegmentId = subtitle.segmentId;
-          this.liveSttText.set(subtitle.originalText);
-          this.liveLocalTranslation.set(subtitle.translatedText);
-          this.liveLocalSourceText = subtitle.originalText.trim();
-          this.liveAiOriginal.set('');
-          this.liveAiTranslation.set('');
-          this.liveAiPending.set(subtitle.requestAi);
-          this.addLocalHistory(subtitle);
+          void this.handleReceivedSubtitle(subtitle);
         }
       );
 
@@ -668,9 +667,20 @@ export class ConversationPageComponent
       await this.connect();
     }
 
+    const platform: ParticipantInfo['platform'] =
+      Capacitor.isNativePlatform()
+        ? (Capacitor.getPlatform() === 'ios' ? 'ios' : 'android')
+        : 'web';
+
     await this.signalR.joinSession(
       sessionId,
-      this.selectedLanguage
+      this.selectedLanguage,
+      {
+        language: this.selectedLanguage,
+        platform,
+        localTranslation:
+          platform === 'android'
+      }
     );
 
     this.joined.set(
@@ -878,9 +888,15 @@ export class ConversationPageComponent
     }
 
     /*
-     * FINAL is the authoritative utterance boundary. It may also
-     * contain a correction that was not present in the last partial,
-     * so show/translate the exact FINAL once more.
+     * FINAL is the authoritative utterance boundary.
+     *
+     * IMPORTANT FOR THE CURRENT LOCAL-ONLY TEST:
+     * do NOT split the final sentence into 5-word chunks.
+     * The exact complete Sherpa FINAL is translated locally and
+     * sent through SignalR as ONE subtitle message.
+     *
+     * This guarantees that Chrome receives the same complete
+     * utterance that the Android side commits.
      */
     this.latestPartialText =
       cleanFinal;
@@ -889,63 +905,10 @@ export class ConversationPageComponent
       cleanFinal
     );
 
-    const words =
-      this.splitWords(
-        cleanFinal
-      );
-
-    let index = 0;
-
-    /*
-     * Split only AFTER Sherpa FINAL. This keeps long committed
-     * subtitles manageable without ever cutting an active rolling
-     * Sherpa hypothesis.
-     */
-    while (index < words.length) {
-
-      const chunkWords: string[] = [];
-
-      while (index < words.length) {
-
-        const word =
-          words[index];
-
-        const candidate =
-          [...chunkWords, word].join(' ');
-
-        if (
-          chunkWords.length > 0 &&
-          (
-            chunkWords.length >= this.maxChunkWords ||
-            candidate.length > this.targetChunkChars
-          )
-        ) {
-          break;
-        }
-
-        chunkWords.push(word);
-        index++;
-
-        if (
-          chunkWords.length >= this.maxChunkWords ||
-          chunkWords.join(' ').length >= this.targetChunkChars
-        ) {
-          break;
-        }
-      }
-
-      const chunk =
-        chunkWords.join(' ');
-
-      if (!chunk) {
-        break;
-      }
-
-      void this.commitChunk(
-        chunk,
-        index >= words.length
-      );
-    }
+    void this.commitChunk(
+      cleanFinal,
+      true
+    );
 
     this.resetSherpaSegment();
   }
@@ -993,74 +956,148 @@ export class ConversationPageComponent
     if (!targetLanguage || !this.joined()) return;
 
     const segmentId = this.createSegmentId();
-    let localTranslatedText = cleanText;
+    const remote = this.remoteParticipant();
+    const receiverTranslatesLocally =
+      remote?.localTranslation === true;
 
-    try {
-      // Reuse the rolling ML Kit result whenever it belongs to this exact text.
-      if (
-        this.liveLocalSourceText === cleanText &&
+    /*
+     * MOBILE -> MOBILE:
+     * Do not wait for sender-side ML Kit. Send the authoritative STT
+     * immediately; the receiver translates into its own language.
+     *
+     * MOBILE -> WEB TEST FALLBACK:
+     * Browser currently has no local ML Kit translator, so the Android
+     * sender still translates before sending.
+     */
+    let localTranslatedText =
+      this.liveLocalSourceText === cleanText &&
         this.liveLocalTranslation().trim()
-      ) {
-        localTranslatedText = this.liveLocalTranslation().trim();
-      } else if (
-        this.selectedLanguage !== targetLanguage &&
-        Capacitor.isNativePlatform() &&
-        Capacitor.getPlatform() === 'android'
-      ) {
+        ? this.liveLocalTranslation().trim()
+        : cleanText;
+
+    if (
+      !receiverTranslatesLocally &&
+      this.selectedLanguage !== targetLanguage &&
+      Capacitor.isNativePlatform() &&
+      Capacitor.getPlatform() === 'android' &&
+      localTranslatedText === cleanText
+    ) {
+      try {
         const localResult = await this.offlineTranslation.translate(
           cleanText,
           this.selectedLanguage,
           targetLanguage
         );
         localTranslatedText = localResult.translatedText;
+      } catch (error) {
+        console.error('★★★★★ CHROME FALLBACK ML KIT FAILED ★★★★★', error);
       }
-    } catch (error) {
-      console.error('★★★★★ COMMITTED ML KIT FAILED ★★★★★', error);
     }
 
-    const localSubtitle: SubtitleMessage = {
+    const outgoingSubtitle: SubtitleMessage = {
       segmentId,
       originalText: cleanText,
-      translatedText: localTranslatedText,
+      translatedText: receiverTranslatesLocally
+        ? cleanText
+        : localTranslatedText,
       sourceLanguage: this.selectedLanguage,
       targetLanguage,
       stage: 'local',
-      requestAi: this.translationMode === 'premium'
+      requestAi: false
     };
 
-    // Sender stores LOCAL immediately. No OpenAI wait.
-    this.subtitle.set(localSubtitle);
+    // Sender UI may keep showing its already available rolling ML Kit result.
+    // It is not part of the mobile->mobile network critical path.
+    this.subtitle.set({
+      ...outgoingSubtitle,
+      translatedText: localTranslatedText
+    });
     this.latestDisplayedSegmentId = segmentId;
-    this.addLocalHistory(localSubtitle);
+    this.addLocalHistory({
+      ...outgoingSubtitle,
+      translatedText: localTranslatedText
+    });
 
     if (this.liveSttText().trim() === cleanText) {
       this.liveLocalTranslation.set(localTranslatedText);
       this.liveLocalSourceText = cleanText;
       this.liveAiOriginal.set('');
       this.liveAiTranslation.set('');
-      this.liveAiPending.set(localSubtitle.requestAi);
+      this.liveAiPending.set(false);
     }
 
     try {
-      // Hub relays LOCAL immediately, then only QUEUES OpenAI.
-      // This await waits for the short Hub invocation, NOT for OpenAI.
       await this.signalR.sendSubtitle(
         this.sessionId.trim(),
-        localSubtitle
+        outgoingSubtitle
       );
 
       this.translationLog('LOCAL_SIGNALR_SENT', {
         segmentId,
         originalText: cleanText,
-        translatedText: localTranslatedText,
-        requestAi: localSubtitle.requestAi
+        translatedText: outgoingSubtitle.translatedText,
+        receiverTranslatesLocally,
+        remotePlatform: remote?.platform ?? 'unknown',
+        requestAi: false
       });
     } catch (error) {
       console.error('★★★★★ LOCAL SUBTITLE SIGNALR FAILED ★★★★★', error);
-      if (this.latestDisplayedSegmentId === segmentId) {
-        this.liveAiPending.set(false);
+    }
+  }
+
+  private async handleReceivedSubtitle(
+    incoming: SubtitleMessage
+  ): Promise<void> {
+
+    const originalText = incoming.originalText.trim();
+    if (!originalText) return;
+
+    let translatedText = incoming.translatedText?.trim() || originalText;
+
+    // Final mobile architecture: the receiving Android translates the
+    // speaker's STT into its own selected language.
+    if (
+      Capacitor.isNativePlatform() &&
+      Capacitor.getPlatform() === 'android' &&
+      incoming.sourceLanguage !== this.selectedLanguage
+    ) {
+      try {
+        const result = await this.offlineTranslation.translate(
+          originalText,
+          incoming.sourceLanguage,
+          this.selectedLanguage
+        );
+        translatedText = result.translatedText;
+      } catch (error) {
+        console.error('★★★★★ RECEIVER ML KIT FAILED ★★★★★', error);
+        // Keep sender-provided fallback if translation fails.
       }
     }
+
+    const subtitle: SubtitleMessage = {
+      ...incoming,
+      translatedText,
+      targetLanguage: this.selectedLanguage,
+      requestAi: false
+    };
+
+    this.subtitle.set(subtitle);
+    this.latestDisplayedSegmentId = subtitle.segmentId;
+    this.liveSttText.set(originalText);
+    this.liveLocalTranslation.set(translatedText);
+    this.liveLocalSourceText = originalText;
+    this.liveAiOriginal.set('');
+    this.liveAiTranslation.set('');
+    this.liveAiPending.set(false);
+    this.addLocalHistory(subtitle);
+
+    this.translationLog('REMOTE_LOCAL_TRANSLATED', {
+      segmentId: subtitle.segmentId,
+      sourceLanguage: incoming.sourceLanguage,
+      targetLanguage: this.selectedLanguage,
+      originalText,
+      translatedText
+    });
   }
 
 

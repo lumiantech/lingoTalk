@@ -249,6 +249,23 @@
         @if (subtitlesVisible()) {
 
         @if (
+          webRtc.callConnected() &&
+          speech.state() !== 'ready' &&
+          speech.state() !== 'speaking' &&
+          speech.state() !== 'processing'
+        ) {
+        <div class="stt-status stt-status-starting">
+          <span class="stt-status-dot"></span>
+          Pokretanje prepoznavanja govora…
+        </div>
+        } @else if (webRtc.callConnected()) {
+        <div class="stt-status stt-status-ready">
+          <span class="stt-status-dot"></span>
+          STT spreman
+        </div>
+        }
+
+        @if (
         liveSttText() ||
         liveLocalTranslation() ||
         liveAiTranslation() ||

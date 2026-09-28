@@ -8,6 +8,12 @@ import {
 
 export type SubtitleStage = 'local' | 'ai';
 
+export interface ParticipantInfo {
+  language: string;
+  platform: 'android' | 'ios' | 'web';
+  localTranslation: boolean;
+}
+
 export interface SubtitleMessage {
   segmentId: string;
   originalText: string;
@@ -37,9 +43,19 @@ export class TranslationSignalRService {
     await this.hubConnection.start();
   }
 
-  async joinSession(sessionId: string, language: string): Promise<void> {
+  async joinSession(
+    sessionId: string,
+    language: string,
+    participant: ParticipantInfo
+  ): Promise<void> {
     this.ensureConnected();
-    await this.hubConnection!.invoke('JoinSession', sessionId, language);
+    await this.hubConnection!.invoke(
+      'JoinSession',
+      sessionId,
+      language,
+      participant.platform,
+      participant.localTranslation
+    );
   }
 
   async updateLanguage(sessionId: string, language: string): Promise<void> {
@@ -50,6 +66,11 @@ export class TranslationSignalRService {
   async leaveSession(sessionId: string): Promise<void> {
     if (this.hubConnection?.state !== HubConnectionState.Connected) return;
     await this.hubConnection.invoke('LeaveSession', sessionId);
+  }
+
+  onParticipantChanged(handler: (participant: ParticipantInfo) => void): void {
+    this.hubConnection?.off('ParticipantChanged');
+    this.hubConnection?.on('ParticipantChanged', handler);
   }
 
   onParticipantLanguageChanged(handler: (language: string) => void): void {

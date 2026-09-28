@@ -81,23 +81,17 @@ export class SpeechRecognitionService {
 
   readonly state = signal('stopped');
 
-  readonly engine =
-    signal<SttEngine>('none');
+  readonly engine = signal<SttEngine>('none');
 
-  readonly language =
-    signal('hr-HR');
+  readonly language = signal('hr-HR');
 
-  readonly error =
-    signal<string | null>(null);
+  readonly error = signal<string | null>(null);
 
-  readonly modelReady =
-    signal(false);
+  readonly modelReady = signal(false);
 
-  readonly modelInstalling =
-    signal(false);
+  readonly modelInstalling = signal(false);
 
-  readonly modelInstallProgress =
-    signal(0);
+  readonly modelInstallProgress = signal(0);
 
   private initialized = false;
   private running = false;
@@ -247,13 +241,20 @@ export class SpeechRecognitionService {
 
     try {
 
+      // UI enters the initializing state immediately. Native Sherpa will emit
+      // stateChanged("ready") only after OnlineRecognizer + stream exist.
+      this.state.set('sherpa_starting');
+      this.engine.set('sherpa');
+
       await NativeSpeechRecognition.start({
         language
       });
 
       this.running = true;
 
-      this.state.set('listening');
+      // IMPORTANT: do not set "listening" here. Native start() returns before
+      // the heavy Sherpa initialization has finished. stateChanged("ready")
+      // is the single source of truth for STT readiness.
 
     } catch (error) {
 
@@ -382,8 +383,8 @@ export class SpeechRecognitionService {
 
         this.error.set(
           `${data.engine
-              ? `[${data.engine}] `
-              : ''
+            ? `[${data.engine}] `
+            : ''
             }${data.code ?? ''
             } ${data.message
             }`.trim()

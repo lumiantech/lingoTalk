@@ -825,3 +825,43 @@
 .lingo-shell.native-call-active .video-stage {
   background: transparent;
 }
+
+
+/* STT readiness: call setup is never blocked by Sherpa initialization. */
+.stt-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 10px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(8px);
+}
+
+.stt-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.stt-status-starting {
+  opacity: 0.82;
+}
+
+.stt-status-starting .stt-status-dot {
+  animation: lingo-stt-pulse 1s ease-in-out infinite;
+}
+
+.stt-status-ready {
+  opacity: 0.68;
+}
+
+@keyframes lingo-stt-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
