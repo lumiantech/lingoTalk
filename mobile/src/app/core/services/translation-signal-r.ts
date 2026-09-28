@@ -16,12 +16,20 @@ export interface ParticipantInfo {
 
 export interface SubtitleMessage {
   segmentId: string;
+  senderSentAt: number;
   originalText: string;
   translatedText: string;
   sourceLanguage: string;
   targetLanguage: string;
   stage: SubtitleStage;
   requestAi: boolean;
+}
+
+export interface SubtitleRenderedAck {
+  segmentId: string;
+  senderSentAt: number;
+  receiverReceivedAt: number;
+  receiverRenderedAt: number;
 }
 
 @Injectable({ providedIn: 'root' })
@@ -91,6 +99,19 @@ export class TranslationSignalRService {
   onSubtitleReceived(handler: (subtitle: SubtitleMessage) => void): void {
     this.hubConnection?.off('SubtitleReceived');
     this.hubConnection?.on('SubtitleReceived', handler);
+  }
+
+  async sendSubtitleRenderedAck(
+    sessionId: string,
+    ack: SubtitleRenderedAck
+  ): Promise<void> {
+    this.ensureConnected();
+    await this.hubConnection!.invoke('SendSubtitleRenderedAck', sessionId, ack);
+  }
+
+  onSubtitleRenderedAck(handler: (ack: SubtitleRenderedAck) => void): void {
+    this.hubConnection?.off('SubtitleRenderedAckReceived');
+    this.hubConnection?.on('SubtitleRenderedAckReceived', handler);
   }
 
   onAiSubtitleReceived(handler: (subtitle: SubtitleMessage) => void): void {

@@ -44,11 +44,9 @@ import {
   WebRtcService
 } from '../../../core/services/web-rtc.service';
 
-// import {
-//   SpeechRecognitionService
-// } from '../../../core/services/speech-recognition.service';
-// import { ParticipantInfo, SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
-import { SpeechRecognitionService } from '../../../core/services/speech-recognition.service';
+import {
+  SpeechRecognitionService
+} from '../../../core/services/speech-recognition.service';
 import { ParticipantInfo, SubtitleMessage, TranslationSignalRService } from '../../../core/services/translation-signal-r';
 
 
@@ -128,7 +126,8 @@ export class ConversationPageComponent
     Capacitor.isNativePlatform() &&
     Capacitor.getPlatform() === 'android';
 
-  private readonly signalR = inject(TranslationSignalRService);
+  private readonly signalR =
+    inject(TranslationSignalRService);
 
   private readonly offlineTranslation =
     inject(OfflineTranslationService);
@@ -174,7 +173,8 @@ export class ConversationPageComponent
   readonly webRtc =
     inject(WebRtcService);
 
-  readonly speech =    inject(SpeechRecognitionService);
+  readonly speech =
+    inject(SpeechRecognitionService);
 
 
   readonly languages = [
@@ -204,11 +204,14 @@ export class ConversationPageComponent
 
   joined = signal(false);
 
-  remoteLanguage = signal<string | null>(null);
+  remoteLanguage =
+    signal<string | null>(null);
 
-  readonly remoteParticipant = signal<ParticipantInfo | null>(null);
+  readonly remoteParticipant =
+    signal<ParticipantInfo | null>(null);
 
-  subtitle = signal<SubtitleMessage | null>(null);
+  subtitle =
+    signal<SubtitleMessage | null>(null);
 
   /*
    * LIVE subtitle pipeline:
@@ -241,6 +244,10 @@ export class ConversationPageComponent
   readonly activeHistory = signal<'local' | 'ai'>('local');
 
   private latestDisplayedSegmentId = '';
+
+  // Diagnostic only: sender-side monotonic-enough wall-clock marker per subtitle.
+  // Used with receiver render ACK so both events are visible in Android logcat.
+  private readonly subtitleSendStartedAt = new Map<string, number>();
 
   // Call UI state. Audio/video track control stays inside WebRtcService.
   readonly microphoneEnabled = signal(true);
@@ -603,6 +610,34 @@ export class ConversationPageComponent
       .onSubtitleReceived(
         subtitle => {
           void this.handleReceivedSubtitle(subtitle);
+        }
+      );
+
+    this.signalR
+      .onSubtitleRenderedAck(
+        ack => {
+          const sendStartedAt =
+            this.subtitleSendStartedAt.get(ack.segmentId);
+
+          const ackReceivedAt = Date.now();
+
+          this.translationLog('REMOTE_RENDERED_ACK', {
+            segmentId: ack.segmentId,
+            sendStartedAt,
+            receiverReceivedAt: ack.receiverReceivedAt,
+            receiverRenderedAt: ack.receiverRenderedAt,
+            ackReceivedAt,
+            roundTripToRenderedAckMs:
+              sendStartedAt === undefined
+                ? null
+                : ackReceivedAt - sendStartedAt,
+            receiverReportedSendToRenderMs:
+              ack.senderSentAt > 0
+                ? ack.receiverRenderedAt - ack.senderSentAt
+                : null
+          });
+
+          this.subtitleSendStartedAt.delete(ack.segmentId);
         }
       );
 
@@ -971,7 +1006,7 @@ export class ConversationPageComponent
      */
     let localTranslatedText =
       this.liveLocalSourceText === cleanText &&
-        this.liveLocalTranslation().trim()
+      this.liveLocalTranslation().trim()
         ? this.liveLocalTranslation().trim()
         : cleanText;
 
@@ -996,6 +1031,7 @@ export class ConversationPageComponent
 
     const outgoingSubtitle: SubtitleMessage = {
       segmentId,
+      senderSentAt: 0,
       originalText: cleanText,
       translatedText: receiverTranslatesLocally
         ? cleanText
@@ -1027,6 +1063,18 @@ export class ConversationPageComponent
     }
 
     try {
+      const sendStartedAt = Date.now();
+      outgoingSubtitle.senderSentAt = sendStartedAt;
+      this.subtitleSendStartedAt.set(segmentId, sendStartedAt);
+
+      this.translationLog('SUBTITLE_SEND_START', {
+        segmentId,
+        senderSentAt: sendStartedAt,
+        originalText: cleanText,
+        translatedText: outgoingSubtitle.translatedText,
+        remotePlatform: remote?.platform ?? 'unknown'
+      });
+
       await this.signalR.sendSubtitle(
         this.sessionId.trim(),
         outgoingSubtitle
@@ -1048,6 +1096,18 @@ export class ConversationPageComponent
   private async handleReceivedSubtitle(
     incoming: SubtitleMessage
   ): Promise<void> {
+
+    const receiverReceivedAt = Date.now();
+
+    this.translationLog('SUBTITLE_RECEIVED', {
+      segmentId: incoming.segmentId,
+      senderSentAt: incoming.senderSentAt,
+      receiverReceivedAt,
+      apparentNetworkMs:
+        incoming.senderSentAt > 0
+          ? receiverReceivedAt - incoming.senderSentAt
+          : null
+    });
 
     const originalText = incoming.originalText.trim();
     if (!originalText) return;
@@ -1097,6 +1157,42 @@ export class ConversationPageComponent
       targetLanguage: this.selectedLanguage,
       originalText,
       translatedText
+    });
+
+    // Wait until Angular has had two browser paint opportunities.
+    // The ACK is diagnostic only and never participates in subtitle delivery.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const receiverRenderedAt = Date.now();
+
+        this.translationLog('SUBTITLE_RENDERED', {
+          segmentId: subtitle.segmentId,
+          senderSentAt: incoming.senderSentAt,
+          receiverReceivedAt,
+          receiverRenderedAt,
+          apparentSendToRenderMs:
+            incoming.senderSentAt > 0
+              ? receiverRenderedAt - incoming.senderSentAt
+              : null
+        });
+
+        void this.signalR
+          .sendSubtitleRenderedAck(
+            this.sessionId.trim(),
+            {
+              segmentId: subtitle.segmentId,
+              senderSentAt: incoming.senderSentAt,
+              receiverReceivedAt,
+              receiverRenderedAt
+            }
+          )
+          .catch(error => {
+            console.error(
+              '★★★★★ SUBTITLE RENDER ACK FAILED ★★★★★',
+              error
+            );
+          });
+      });
     });
   }
 

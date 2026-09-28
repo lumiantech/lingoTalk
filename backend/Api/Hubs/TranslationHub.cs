@@ -13,10 +13,6 @@ public sealed class TranslationHub : Hub
 
     private static readonly ConcurrentDictionary<string, Participant> Participants = new();
 
-    // ============================================================
-    // SESSION / PARTICIPANTS
-    // ============================================================
-
     public async Task JoinSession(
         string sessionId,
         string language,
@@ -36,269 +32,127 @@ public sealed class TranslationHub : Hub
         if (string.IsNullOrWhiteSpace(language))
             throw new HubException("Language is required.");
 
-        await Groups.AddToGroupAsync(
-            Context.ConnectionId,
-            sessionId);
+        await Groups.AddToGroupAsync(Context.ConnectionId, sessionId);
 
-        var participant = new Participant(
-            sessionId,
-            language,
-            platform,
-            localTranslation);
-
+        var participant = new Participant(sessionId, language, platform, localTranslation);
         Participants[Context.ConnectionId] = participant;
 
-        /*
-         * Tell the new participant about everybody who is
-         * already in the session.
-         */
         var existingParticipants = Participants
-            .Where(x =>
-                x.Key != Context.ConnectionId &&
-                x.Value.SessionId == sessionId)
+            .Where(x => x.Key != Context.ConnectionId && x.Value.SessionId == sessionId)
             .Select(x => x.Value)
             .ToList();
 
         foreach (var existingParticipant in existingParticipants)
-        {
-            await SendParticipantChanged(
-                Clients.Caller,
-                existingParticipant);
-        }
+            await SendParticipantChanged(Clients.Caller, existingParticipant);
 
-        /*
-         * Tell everybody else about the new participant.
-         */
-        await SendParticipantChanged(
-            Clients.OthersInGroup(sessionId),
-            participant);
+        await SendParticipantChanged(Clients.OthersInGroup(sessionId), participant);
     }
 
-    public async Task UpdateLanguage(
-        string sessionId,
-        string language)
+    public async Task UpdateLanguage(string sessionId, string language)
     {
         sessionId = sessionId.Trim();
         language = language.Trim();
 
-        if (string.IsNullOrWhiteSpace(sessionId))
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        if (string.IsNullOrWhiteSpace(language)) return;
+
+        if (!Participants.TryGetValue(Context.ConnectionId, out var participant))
             return;
 
-        if (string.IsNullOrWhiteSpace(language))
-            return;
-
-        if (!Participants.TryGetValue(
-                Context.ConnectionId,
-                out var participant))
-        {
-            return;
-        }
-
-        var updated = participant with
-        {
-            Language = language
-        };
-
+        var updated = participant with { Language = language };
         Participants[Context.ConnectionId] = updated;
 
-        await SendParticipantChanged(
-            Clients.OthersInGroup(sessionId),
-            updated);
+        await SendParticipantChanged(Clients.OthersInGroup(sessionId), updated);
     }
 
     public async Task LeaveSession(string sessionId)
     {
         sessionId = sessionId.Trim();
-
-        Participants.TryRemove(
-            Context.ConnectionId,
-            out _);
-
-        await Groups.RemoveFromGroupAsync(
-            Context.ConnectionId,
-            sessionId);
-
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync("ParticipantLeft");
+        Participants.TryRemove(Context.ConnectionId, out _);
+        await Groups.RemoveFromGroupAsync(Context.ConnectionId, sessionId);
+        await Clients.OthersInGroup(sessionId).SendAsync("ParticipantLeft");
     }
 
-    public override async Task OnDisconnectedAsync(
-        Exception? exception)
+    public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        if (Participants.TryRemove(
-                Context.ConnectionId,
-                out var participant))
-        {
-            await Clients
-                .OthersInGroup(participant.SessionId)
-                .SendAsync("ParticipantLeft");
-        }
+        if (Participants.TryRemove(Context.ConnectionId, out var participant))
+            await Clients.OthersInGroup(participant.SessionId).SendAsync("ParticipantLeft");
 
         await base.OnDisconnectedAsync(exception);
     }
 
-    // ============================================================
-    // SUBTITLES
-    // ============================================================
-
-    public async Task SendSubtitle(
-        string sessionId,
-        SubtitleMessage message)
+    public async Task SendSubtitle(string sessionId, SubtitleMessage message)
     {
         sessionId = sessionId.Trim();
-
-        if (string.IsNullOrWhiteSpace(sessionId))
-            return;
-
-        if (string.IsNullOrWhiteSpace(message.SegmentId))
-            return;
-
-        /*
-         * User-to-user translation is now LOCAL.
-         *
-         * Normal mobile -> mobile:
-         *
-         *   sender:
-         *      Sherpa STT
-         *          ↓
-         *      originalText
-         *
-         *   SignalR:
-         *      transports originalText
-         *
-         *   receiver:
-         *      ML Kit translates into receiver's selected language.
-         *
-         *
-         * Temporary browser test fallback:
-         *
-         * If the receiver has no local translation capability,
-         * the Android sender may put its locally translated text
-         * into translatedText before calling this method.
-         *
-         * The Hub does NOT translate anything.
-         */
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        if (string.IsNullOrWhiteSpace(message.SegmentId)) return;
 
         message.Stage = "local";
-
-        /*
-         * OpenAI translation is intentionally disabled for
-         * user-to-user conversations.
-         */
         message.RequestAi = false;
 
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync(
-                "SubtitleReceived",
-                message);
+        await Clients.OthersInGroup(sessionId)
+            .SendAsync("SubtitleReceived", message);
     }
 
-    // ============================================================
-    // MANUAL TEXT CHAT
-    // ============================================================
-
-    public async Task SendText(
-        string sessionId,
-        string text)
+    // Diagnostic ACK: receiver sends this only after the subtitle has had
+    // two browser paint opportunities. It never affects subtitle delivery.
+    public async Task SendSubtitleRenderedAck(string sessionId, SubtitleRenderedAck ack)
     {
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync(
-                "TextReceived",
-                text);
+        sessionId = sessionId.Trim();
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        if (string.IsNullOrWhiteSpace(ack.SegmentId)) return;
+
+        await Clients.OthersInGroup(sessionId)
+            .SendAsync("SubtitleRenderedAckReceived", ack);
     }
 
-    // ============================================================
-    // WEBRTC SIGNALING
-    // ============================================================
-
-    public async Task SendWebRtcOffer(
-        string sessionId,
-        string offer)
+    public async Task SendText(string sessionId, string text)
     {
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync(
-                "WebRtcOfferReceived",
-                offer);
+        await Clients.OthersInGroup(sessionId).SendAsync("TextReceived", text);
     }
 
-    public async Task SendWebRtcAnswer(
-        string sessionId,
-        string answer)
+    public async Task SendWebRtcOffer(string sessionId, string offer)
     {
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync(
-                "WebRtcAnswerReceived",
-                answer);
+        await Clients.OthersInGroup(sessionId).SendAsync("WebRtcOfferReceived", offer);
     }
 
-    public async Task SendIceCandidate(
-        string sessionId,
-        string candidate)
+    public async Task SendWebRtcAnswer(string sessionId, string answer)
     {
-        await Clients
-            .OthersInGroup(sessionId)
-            .SendAsync(
-                "IceCandidateReceived",
-                candidate);
+        await Clients.OthersInGroup(sessionId).SendAsync("WebRtcAnswerReceived", answer);
     }
 
-    // ============================================================
-    // PARTICIPANT CAPABILITIES
-    // ============================================================
-
-    private static Task SendParticipantChanged(
-        IClientProxy client,
-        Participant participant)
+    public async Task SendIceCandidate(string sessionId, string candidate)
     {
-        return client.SendAsync(
-            "ParticipantChanged",
-            new
-            {
-                language = participant.Language,
-                platform = participant.Platform,
-                localTranslation = participant.LocalTranslation
-            });
+        await Clients.OthersInGroup(sessionId).SendAsync("IceCandidateReceived", candidate);
+    }
+
+    private static Task SendParticipantChanged(IClientProxy client, Participant participant)
+    {
+        return client.SendAsync("ParticipantChanged", new
+        {
+            language = participant.Language,
+            platform = participant.Platform,
+            localTranslation = participant.LocalTranslation
+        });
     }
 }
-
-// ================================================================
-// SUBTITLE DTO
-// ================================================================
 
 public sealed class SubtitleMessage
 {
     public string SegmentId { get; set; } = "";
-
+    public long SenderSentAt { get; set; }
     public string OriginalText { get; set; } = "";
-
-    /*
-     * Mobile -> mobile:
-     * normally empty when sent by speaker.
-     * Receiver translates OriginalText locally.
-     *
-     * Android -> browser temporary test:
-     * Android sender may populate this because the browser currently
-     * has no local ML Kit translator.
-     */
     public string TranslatedText { get; set; } = "";
-
     public string SourceLanguage { get; set; } = "";
-
     public string TargetLanguage { get; set; } = "";
-
     public string Stage { get; set; } = "local";
-
-    /*
-     * Kept temporarily for frontend DTO compatibility.
-     * Hub forces this to false.
-     *
-     * Once the old AI translation frontend code is removed,
-     * this property can also be deleted.
-     */
     public bool RequestAi { get; set; }
+}
+
+public sealed class SubtitleRenderedAck
+{
+    public string SegmentId { get; set; } = "";
+    public long SenderSentAt { get; set; }
+    public long ReceiverReceivedAt { get; set; }
+    public long ReceiverRenderedAt { get; set; }
 }
