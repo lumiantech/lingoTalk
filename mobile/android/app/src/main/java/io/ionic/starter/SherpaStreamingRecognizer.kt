@@ -35,6 +35,11 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         // affect recognition. They only make the next log easier to read.
         private const val SPEECH_RMS_LOG_THRESHOLD = 0.003f
         private const val SPEECH_PEAK_LOG_THRESHOLD = 0.02f
+
+        // Controlled single-word pause/flush experiment.
+        // PCM arrives in 100 ms chunks, so 7 consecutive quiet chunks = ~700 ms.
+        private const val PAUSE_FLUSH_SILENCE_CHUNKS = 7
+        private const val TAIL_PADDING_SECONDS = 0.30f
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -85,6 +90,12 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
     private var endpointLatched = false
     private var endpointResetCount = 0L
+
+    // Pause-driven utterance finalization. These are touched only on the
+    // single Sherpa executor, so no additional lock is required.
+    private var utteranceHasSpeech = false
+    private var consecutiveSilenceChunks = 0
+    private var pauseFlushCount = 0L
 
     // ============================================================
     // START
@@ -158,26 +169,29 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     EndpointConfig(
                         // Empty/silence endpoint is deliberately pushed far away.
                         // We do not want normal pauses to create empty endpoints.
-                        rule1 = EndpointRule(
-                            mustContainNonSilence = false,
-                            minTrailingSilence = 30.0f,
-                            minUtteranceLength = 0.0f,
-                        ),
+                        rule1 =
+                            EndpointRule(
+                                mustContainNonSilence = false,
+                                minTrailingSilence = 30.0f,
+                                minUtteranceLength = 0.0f,
+                            ),
                         // Normal speech endpoint. Keep the existing 1.8 s value for this
                         // controlled test so we change endpoint lifecycle, not tuning.
-                        rule2 = EndpointRule(
-                            mustContainNonSilence = true,
-                            minTrailingSilence = 1.8f,
-                            minUtteranceLength = 0.0f,
-                        ),
+                        rule2 =
+                            EndpointRule(
+                                mustContainNonSilence = true,
+                                minTrailingSilence = 1.8f,
+                                minUtteranceLength = 0.0f,
+                            ),
                         // Safety boundary for a very long stream. IMPORTANT:
                         // mustContainNonSilence=true prevents pure silence from permanently
                         // latching endpoint=true after 20 seconds.
-                        rule3 = EndpointRule(
-                            mustContainNonSilence = true,
-                            minTrailingSilence = 0.0f,
-                            minUtteranceLength = 20.0f,
-                        ),
+                        rule3 =
+                            EndpointRule(
+                                mustContainNonSilence = true,
+                                minTrailingSilence = 0.0f,
+                                minUtteranceLength = 20.0f,
+                            ),
                     )
 
                 val config =
@@ -204,6 +218,9 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 lastText = ""
                 endpointLatched = false
                 endpointResetCount = 0L
+                utteranceHasSpeech = false
+                consecutiveSilenceChunks = 0
+                pauseFlushCount = 0L
 
                 pcmChunkCount = 0L
                 totalPcmBytes = 0L
@@ -351,8 +368,14 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     }
 
                 val speechLike =
-                    rms >= SPEECH_RMS_LOG_THRESHOLD ||
-                        peak >= SPEECH_PEAK_LOG_THRESHOLD
+                    rms >= SPEECH_RMS_LOG_THRESHOLD || peak >= SPEECH_PEAK_LOG_THRESHOLD
+
+                if (speechLike) {
+                    utteranceHasSpeech = true
+                    consecutiveSilenceChunks = 0
+                } else if (utteranceHasSpeech) {
+                    consecutiveSilenceChunks++
+                }
 
                 /*
                  * Log first 10 chunks, then every 10th chunk.
@@ -458,6 +481,80 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 }
 
                 // ------------------------------------------------
+                // PAUSE-DRIVEN FLUSH
+                // ------------------------------------------------
+                //
+                // A short utterance can remain buffered with result.text == "".
+                // After ~700 ms of real PCM silence following detected speech,
+                // finish THIS stream exactly as Sherpa's completed-audio examples do:
+                // tail padding -> inputFinished -> decode until drained -> result.
+                // Then replace the finished stream with a fresh stream while keeping
+                // the already-loaded OnlineRecognizer/model alive.
+                if (utteranceHasSpeech && consecutiveSilenceChunks >= PAUSE_FLUSH_SILENCE_CHUNKS) {
+                    pauseFlushCount++
+
+                    Log.i(
+                        TAG,
+                        "★★★★★ PAUSE_FLUSH START count=$pauseFlushCount " +
+                            "chunk=$pcmChunkCount silenceChunks=$consecutiveSilenceChunks " +
+                            "preFlushText='$text' ★★★★★",
+                    )
+
+                    val tailSamples = FloatArray((SAMPLE_RATE * TAIL_PADDING_SECONDS).toInt())
+
+                    s.acceptWaveform(tailSamples, SAMPLE_RATE)
+                    s.inputFinished()
+
+                    var flushDecodes = 0
+                    while (r.isReady(s)) {
+                        r.decode(s)
+                        decodeCount++
+                        flushDecodes++
+                    }
+
+                    val flushedText = r.getResult(s).text.trim()
+
+                    Log.i(
+                        TAG,
+                        "★★★★★ PAUSE_FLUSH RESULT count=$pauseFlushCount " +
+                            "flushDecodes=$flushDecodes text='$flushedText' ★★★★★",
+                    )
+
+                    if (flushedText.isNotEmpty()) {
+                        if (flushedText != lastText) {
+                            listener.onSherpaPartial(flushedText, language)
+                        }
+
+                        Log.i(
+                            TAG,
+                            "★★★★★ FINAL reason=pause_flush language=$language " +
+                                "text='$flushedText' ★★★★★",
+                        )
+                        listener.onSherpaFinal(flushedText, language)
+                    } else {
+                        Log.i(TAG, "★★★★★ PAUSE_FLUSH EMPTY count=$pauseFlushCount ★★★★★")
+                    }
+
+                    // inputFinished() permanently closes this stream for input.
+                    // Release it and immediately create the next utterance stream.
+                    s.release()
+                    stream = r.createStream().also { it.setOption("language", language) }
+
+                    lastText = ""
+                    endpointLatched = false
+                    utteranceHasSpeech = false
+                    consecutiveSilenceChunks = 0
+
+                    Log.i(
+                        TAG,
+                        "★★★★★ STREAM REPLACED reason=pause_flush " +
+                            "count=$pauseFlushCount language=$language ★★★★★",
+                    )
+
+                    return@execute
+                }
+
+                // ------------------------------------------------
                 // ENDPOINT / FINAL RESULT
                 // ------------------------------------------------
 
@@ -492,6 +589,8 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                         s.setOption("language", language)
                         lastText = ""
                         endpointLatched = false
+                        utteranceHasSpeech = false
+                        consecutiveSilenceChunks = 0
                         endpointResetCount++
 
                         Log.i(
@@ -542,20 +641,22 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     maxQueue = maxQueuedChunkCount
                     maxDelay = maxEnqueueDelayMs
                     avgProcessing =
-                        if (completedChunkCount > 0L) totalProcessingMs / completedChunkCount else 0.0
+                        if (completedChunkCount > 0L) totalProcessingMs / completedChunkCount
+                        else 0.0
                     avgDecode =
                         if (completedChunkCount > 0L) totalDecodeMs / completedChunkCount else 0.0
                     totalAudio = totalAcceptedAudioMs
                     realtimeFactor =
-                        if (totalAcceptedAudioMs > 0.0) totalProcessingMs / totalAcceptedAudioMs else 0.0
+                        if (totalAcceptedAudioMs > 0.0) totalProcessingMs / totalAcceptedAudioMs
+                        else 0.0
                 }
 
                 if (
                     submittedId <= 20L ||
-                    submittedId % 10L == 0L ||
-                    enqueueDelayMs >= 100.0 ||
-                    processingMs >= audioDurationMs ||
-                    queueDepthAtSubmit > 2L
+                        submittedId % 10L == 0L ||
+                        enqueueDelayMs >= 100.0 ||
+                        processingMs >= audioDurationMs ||
+                        queueDepthAtSubmit > 2L
                 ) {
                     Log.i(
                         TAG,
@@ -646,6 +747,8 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         recognizer = null
         lastText = ""
         endpointLatched = false
+        utteranceHasSpeech = false
+        consecutiveSilenceChunks = 0
     }
 
     // ============================================================
