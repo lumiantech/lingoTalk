@@ -133,6 +133,10 @@ class SpeechRecognitionPlugin : Plugin(), SherpaStreamingRecognizer.Listener {
 
         sherpa = SherpaStreamingRecognizer(context, this)
 
+        // TEMPORARY:
+        // Generate helper audio "zebra coffee window".
+        SherpaHelperAudioGenerator.generate(context)
+
         /*
          * We only subscribe to PCM.
          *
