@@ -12,6 +12,7 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
 import java.io.File
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.sqrt
 
 class SherpaStreamingRecognizer(private val context: Context, private val listener: Listener) {
 
@@ -29,6 +30,11 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         private const val TAG = "LingoSherpa"
         private const val SAMPLE_RATE = 16000
         private const val MODEL_DIR = SherpaModelInstaller.MODEL_DIR
+
+        // Diagnostic only. These thresholds do NOT gate audio and do NOT
+        // affect recognition. They only make the next log easier to read.
+        private const val SPEECH_RMS_LOG_THRESHOLD = 0.003f
+        private const val SPEECH_PEAK_LOG_THRESHOLD = 0.02f
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -72,6 +78,13 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
     private var totalDecodeMs = 0.0
     private var totalAcceptedAudioMs = 0.0
     private var timingStartedNs = 0L
+
+    // ============================================================
+    // SPEECH / ENDPOINT DIAGNOSTICS
+    // ============================================================
+
+    private var endpointLatched = false
+    private var endpointResetCount = 0L
 
     // ============================================================
     // START
@@ -143,24 +156,25 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                 val endpointConfig =
                     EndpointConfig(
-                        // Rule 1 fires even when no speech was decoded. The default 2.4 s
-                        // caused repeated empty endpoints during silence. Keep it only as
-                        // a long safety boundary; normal utterances are finalized by rule 2.
+                        // Empty/silence endpoint is deliberately pushed far away.
+                        // We do not want normal pauses to create empty endpoints.
                         rule1 = EndpointRule(
                             mustContainNonSilence = false,
                             minTrailingSilence = 30.0f,
                             minUtteranceLength = 0.0f,
                         ),
-                        // After real speech has been decoded, allow a little more trailing
-                        // silence than the default. This gives 1-3 word utterances enough
-                        // time to become a stable hypothesis before reset.
+                        // Normal speech endpoint. Keep the existing 1.8 s value for this
+                        // controlled test so we change endpoint lifecycle, not tuning.
                         rule2 = EndpointRule(
                             mustContainNonSilence = true,
                             minTrailingSilence = 1.8f,
                             minUtteranceLength = 0.0f,
                         ),
+                        // Safety boundary for a very long stream. IMPORTANT:
+                        // mustContainNonSilence=true prevents pure silence from permanently
+                        // latching endpoint=true after 20 seconds.
                         rule3 = EndpointRule(
-                            mustContainNonSilence = false,
+                            mustContainNonSilence = true,
                             minTrailingSilence = 0.0f,
                             minUtteranceLength = 20.0f,
                         ),
@@ -188,6 +202,8 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     }
 
                 lastText = ""
+                endpointLatched = false
+                endpointResetCount = 0L
 
                 pcmChunkCount = 0L
                 totalPcmBytes = 0L
@@ -303,9 +319,10 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                 totalSamples += samples.size
 
-                // Calculate simple signal diagnostics.
+                // Signal diagnostics on the exact 16 kHz float PCM given to Sherpa.
                 var peak = 0.0f
                 var sumAbs = 0.0
+                var sumSquares = 0.0
 
                 for (sample in samples) {
 
@@ -316,6 +333,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     }
 
                     sumAbs += amplitude
+                    sumSquares += sample.toDouble() * sample.toDouble()
                 }
 
                 val avgAbs =
@@ -324,6 +342,17 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     } else {
                         0.0
                     }
+
+                val rms =
+                    if (samples.isNotEmpty()) {
+                        sqrt(sumSquares / samples.size).toFloat()
+                    } else {
+                        0.0f
+                    }
+
+                val speechLike =
+                    rms >= SPEECH_RMS_LOG_THRESHOLD ||
+                        peak >= SPEECH_PEAK_LOG_THRESHOLD
 
                 /*
                  * Log first 10 chunks, then every 10th chunk.
@@ -341,7 +370,20 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                             "samples=${samples.size} " +
                             "totalSamples=$totalSamples " +
                             "peak=$peak " +
-                            "avgAbs=$avgAbs ★★★★★",
+                            "avgAbs=$avgAbs " +
+                            "rms=$rms ★★★★★",
+                    )
+                }
+
+                if (speechLike) {
+                    Log.i(
+                        TAG,
+                        "★★★★★ SPEECH_PCM " +
+                            "chunk=$pcmChunkCount " +
+                            "peak=$peak " +
+                            "rms=$rms " +
+                            "avgAbs=$avgAbs " +
+                            "samples=${samples.size} ★★★★★",
                     )
                 }
 
@@ -421,26 +463,53 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                 val endpoint = r.isEndpoint(s)
 
-                if (endpoint) {
+                if (speechLike || decodedThisChunk > 0 || text.isNotEmpty() || endpoint) {
+                    Log.i(
+                        TAG,
+                        "★★★★★ RECO_DIAG " +
+                            "chunk=$pcmChunkCount " +
+                            "peak=$peak " +
+                            "rms=$rms " +
+                            "speechLike=$speechLike " +
+                            "decodedThisChunk=$decodedThisChunk " +
+                            "text='$text' " +
+                            "endpoint=$endpoint ★★★★★",
+                    )
+                }
 
-                    Log.i(TAG, "★★★★★ ENDPOINT DETECTED text='$text' ★★★★★")
+                if (!endpoint) {
+                    endpointLatched = false
+                } else if (!endpointLatched) {
+                    endpointLatched = true
 
-                    // Never destroy the active stream on an empty endpoint. With short
-                    // utterances the acoustic model may need another decode cycle before
-                    // text becomes available. Reset only after we have an actual result.
-                    if (text.isEmpty()) {
-                        Log.i(TAG, "★★★★★ EMPTY ENDPOINT IGNORED - STREAM KEPT ALIVE ★★★★★")
-                        return@execute
+                    Log.i(TAG, "★★★★★ ENDPOINT EDGE text='$text' chunk=$pcmChunkCount ★★★★★")
+
+                    if (text.isNotEmpty()) {
+                        Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
+                        listener.onSherpaFinal(text, language)
+
+                        r.reset(s)
+                        s.setOption("language", language)
+                        lastText = ""
+                        endpointLatched = false
+                        endpointResetCount++
+
+                        Log.i(
+                            TAG,
+                            "★★★★★ STREAM RESET reason=final " +
+                                "count=$endpointResetCount language=$language ★★★★★",
+                        )
+                    } else {
+                        // Do not reset on the first empty endpoint edge. A very short
+                        // utterance can still need another decode cycle. Unlike the old
+                        // code, however, we also do not log/process the same latched
+                        // endpoint on every following 100 ms chunk.
+                        Log.i(
+                            TAG,
+                            "★★★★★ EMPTY ENDPOINT EDGE - WAITING FOR MORE AUDIO " +
+                                "chunk=$pcmChunkCount ★★★★★",
+                        )
                     }
-
-                    Log.i(TAG, "★★★★★ FINAL language=$language text='$text' ★★★★★")
-                    listener.onSherpaFinal(text, language)
-
-                    r.reset(s)
-                    s.setOption("language", language)
-                    lastText = ""
-
-                    Log.i(TAG, "★★★★★ STREAM RESET language=$language ★★★★★")
                 }
             } catch (e: Exception) {
 
@@ -576,6 +645,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         stream = null
         recognizer = null
         lastText = ""
+        endpointLatched = false
     }
 
     // ============================================================

@@ -311,14 +311,16 @@ export class ConversationPageComponent
    * absolute maximum when Sherpa jumps
    * over the 5-word boundary.
    *
-   * IMPORTANT: these limits are used only AFTER Sherpa FINAL.
-   * Active partials are never split or committed by a timer.
+   * Active partials commit during speech: 5 words immediately,
+   * or the remaining 1-4 words after 650 ms without a newer partial.
    */
   private readonly targetChunkWords = 5;
 
   private readonly targetChunkChars = 30;
 
   private readonly maxChunkWords = 5;
+
+  private readonly pauseMs = 650;
 
 
   private translationTimer:
@@ -750,18 +752,9 @@ export class ConversationPageComponent
     }
 
     /*
-     * IMPORTANT:
-     * Sherpa partial is the COMPLETE mutable hypothesis for the
-     * current utterance. Never consume/slice it while speech is active.
-     *
-     * Example:
-     *   need
-     *   need to
-     *   need to fix
-     *   need to fix this
-     *
-     * Every new hypothesis replaces the previous live STT and is
-     * translated immediately by ML Kit. Only Sherpa FINAL commits.
+     * Sherpa partial is the complete mutable hypothesis for the
+     * current utterance. Keep showing/translating the full rolling
+     * hypothesis locally, but commit stable-sized chunks during speech.
      */
     this.latestPartialText =
       cleanText;
@@ -769,7 +762,95 @@ export class ConversationPageComponent
     this.showLiveChunk(
       cleanText
     );
+
+    const words =
+      this.splitWords(
+        cleanText
+      );
+
+    /*
+     * Sherpa can revise the current hypothesis. Words already sent as
+     * subtitle chunks belong to older chunks and must never be resent.
+     */
+    if (
+      words.length <
+      this.consumedWords
+    ) {
+      this.translationLog(
+        'PARTIAL_SHORTER_THAN_CONSUMED',
+        {
+          text: cleanText,
+          words: words.length,
+          consumedWords: this.consumedWords
+        }
+      );
+      return;
+    }
+
+    let remaining =
+      words.slice(
+        this.consumedWords
+      );
+
+    if (remaining.length === 0) {
+      return;
+    }
+
+    /* New speech invalidates the previous pause flush. */
+    this.cancelTranslationTimer();
+
+    /*
+     * Commit while the speaker is still talking.
+     * Five words is the target chunk size used by the original working
+     * behavior. The full mutable partial remains visible locally.
+     */
+    while (
+      remaining.length >=
+      this.targetChunkWords
+    ) {
+      const chunkWords =
+        remaining.slice(
+          0,
+          this.maxChunkWords
+        );
+
+      const chunk =
+        chunkWords.join(' ');
+
+      this.translationLog(
+        'WORD_LIMIT_FLUSH',
+        {
+          chunk,
+          chunkWords: chunkWords.length,
+          availableWords: remaining.length,
+          consumedBefore: this.consumedWords
+        }
+      );
+
+      /* Mark consumed before async work to prevent duplicate sends. */
+      this.consumedWords +=
+        chunkWords.length;
+
+      void this.commitChunk(
+        chunk,
+        false
+      );
+
+      remaining =
+        words.slice(
+          this.consumedWords
+        );
+    }
+
+    /*
+     * One to four remaining words are flushed after 650 ms without a
+     * newer partial. If speech continues, the next partial cancels it.
+     */
+    if (remaining.length > 0) {
+      this.schedulePauseFlush();
+    }
   }
+
 
   private showLiveChunk(
     text: string
@@ -903,14 +984,88 @@ export class ConversationPageComponent
 
 
 
+  private schedulePauseFlush():
+    void {
+
+    this.cancelTranslationTimer();
+
+    this.translationLog(
+      'PAUSE_TIMER_STARTED',
+      {
+        pauseMs: this.pauseMs,
+        consumedWords: this.consumedWords,
+        latestPartialText: this.latestPartialText
+      }
+    );
+
+    this.translationTimer =
+      setTimeout(
+        () => {
+          this.translationTimer =
+            undefined;
+
+          const words =
+            this.splitWords(
+              this.latestPartialText
+            );
+
+          const remaining =
+            words.slice(
+              this.consumedWords
+            );
+
+          if (remaining.length === 0) {
+            return;
+          }
+
+          const chunkWords =
+            remaining.slice(
+              0,
+              this.maxChunkWords
+            );
+
+          const text =
+            chunkWords.join(' ');
+
+          this.translationLog(
+            'PAUSE_FLUSH',
+            {
+              text,
+              words: chunkWords.length,
+              consumedBefore: this.consumedWords
+            }
+          );
+
+          this.consumedWords +=
+            chunkWords.length;
+
+          void this.commitChunk(
+            text,
+            false
+          );
+
+          const stillRemaining =
+            words.length -
+            this.consumedWords;
+
+          if (stillRemaining > 0) {
+            this.processPartial(
+              this.latestPartialText
+            );
+          }
+        },
+        this.pauseMs
+      );
+  }
+
 
   /*
-   * Sherpa FINAL can contain a correction or words not seen in the
-   * latest partial. Show those words immediately, then commit them.
+   * Sherpa FINAL is authoritative for the utterance, but partial chunks
+   * may already have been sent. Commit only words not yet consumed.
    */
-  private flushFinalText(
+  private async flushFinalText(
     finalText: string
-  ): void {
+  ): Promise<void> {
 
     this.cancelTranslationTimer();
 
@@ -922,17 +1077,7 @@ export class ConversationPageComponent
       return;
     }
 
-    /*
-     * FINAL is the authoritative utterance boundary.
-     *
-     * IMPORTANT FOR THE CURRENT LOCAL-ONLY TEST:
-     * do NOT split the final sentence into 5-word chunks.
-     * The exact complete Sherpa FINAL is translated locally and
-     * sent through SignalR as ONE subtitle message.
-     *
-     * This guarantees that Chrome receives the same complete
-     * utterance that the Android side commits.
-     */
+    /* Keep the exact FINAL visible locally. */
     this.latestPartialText =
       cleanFinal;
 
@@ -940,13 +1085,73 @@ export class ConversationPageComponent
       cleanFinal
     );
 
-    void this.commitChunk(
-      cleanFinal,
-      true
-    );
+    const words =
+      this.splitWords(
+        cleanFinal
+      );
+
+    if (
+      words.length <=
+      this.consumedWords
+    ) {
+      this.translationLog(
+        'FINAL_NO_NEW_WORDS',
+        {
+          finalText: cleanFinal,
+          finalWords: words.length,
+          consumedWords: this.consumedWords
+        }
+      );
+
+      this.resetSherpaSegment();
+      return;
+    }
+
+    let remaining =
+      words.slice(
+        this.consumedWords
+      );
+
+    while (remaining.length > 0) {
+      const chunkWords =
+        remaining.slice(
+          0,
+          this.maxChunkWords
+        );
+
+      remaining =
+        remaining.slice(
+          chunkWords.length
+        );
+
+      const text =
+        chunkWords.join(' ');
+
+      const isLast =
+        remaining.length === 0;
+
+      this.translationLog(
+        'FINAL_FLUSH',
+        {
+          text,
+          words: chunkWords.length,
+          isLast,
+          consumedBefore: this.consumedWords
+        }
+      );
+
+      this.consumedWords +=
+        chunkWords.length;
+
+      await this.commitChunk(
+        text,
+        isLast
+      );
+    }
 
     this.resetSherpaSegment();
   }
+
 
   private splitWords(
     text: string
@@ -1258,10 +1463,33 @@ export class ConversationPageComponent
     setTimeout(() => this.scrollHistoryToBottom(), 0);
   }
 
-  toggleHistory(): void {
+  async toggleHistory(): Promise<void> {
     const opening = !this.historyOpen();
     this.historyOpen.set(opening);
-    if (opening) setTimeout(() => this.scrollHistoryToBottom(), 0);
+
+    // Android video uses native SurfaceViewRenderers above the WebView.
+    // Hide them while history is open so the history panel and its Close
+    // button remain fully interactive. Restore their layout when closing.
+    if (this.nativeAndroid && this.webRtc.callConnected()) {
+      if (opening) {
+        await this.webRtc.hideNativeVideoRenderers();
+      } else {
+        this.nativeVideoLayoutActive = true;
+        this.scheduleNativeVideoLayout();
+      }
+    }
+
+    if (opening) {
+      setTimeout(() => this.scrollHistoryToBottom(), 0);
+    }
+  }
+
+  async closeHistory(): Promise<void> {
+    if (!this.historyOpen()) {
+      return;
+    }
+
+    await this.toggleHistory();
   }
 
   private keepHistoryAtBottomIfNeeded(): void {
@@ -1662,6 +1890,50 @@ export class ConversationPageComponent
     await this.speech.stop();
 
     await this.webRtc.endCall();
+  }
+
+
+  async leaveSession():
+    Promise<void> {
+
+    const sessionId = this.sessionId.trim();
+
+    // End media/STT first if a call is still active.
+    if (this.webRtc.callConnected()) {
+      await this.endCall();
+    } else {
+      this.cancelTranslationTimer();
+      this.resetSherpaSegment();
+      this.lastObservedFinal = '';
+      this.subtitle.set(null);
+      await this.speech.stop();
+    }
+
+    if (this.historyOpen()) {
+      this.historyOpen.set(false);
+    }
+
+    if (this.joined() && sessionId) {
+      await this.signalR.leaveSession(sessionId);
+    }
+
+    this.joined.set(false);
+    this.remoteLanguage.set(null);
+    this.remoteParticipant.set(null);
+
+    this.liveSttText.set('');
+    this.liveLocalTranslation.set('');
+    this.liveAiOriginal.set('');
+    this.liveAiTranslation.set('');
+    this.liveAiPending.set(false);
+
+    this.localHistory.set([]);
+    this.aiHistory.set([]);
+    this.messages.set([]);
+
+    this.microphoneEnabled.set(true);
+    this.cameraEnabled.set(true);
+    this.subtitlesVisible.set(true);
   }
 
 

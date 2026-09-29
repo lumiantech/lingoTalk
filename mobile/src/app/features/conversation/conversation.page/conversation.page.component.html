@@ -102,6 +102,11 @@
               <path d="M15 8v8H5a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2h10Zm2 2.5 4-2.5v8l-4-2.5v-3Z" />
             </svg>
           </button>
+
+          <button class="round-icon" type="button" aria-label="Leave session" title="Leave session"
+            (click)="leaveSession()">
+            ×
+          </button>
         </section>
         }
 
@@ -237,11 +242,21 @@
 
         <div class="call-language-pill">
 
-          {{ selectedLanguage }}
+          <ion-select
+            aria-label="My spoken language"
+            interface="popover"
+            [(ngModel)]="selectedLanguage"
+            (ionChange)="languageChanged()">
 
-          →
+            @for (language of languages; track language.code) {
+            <ion-select-option [value]="language.code">
+              {{ language.name }}
+            </ion-select-option>
+            }
 
-          {{ remoteLanguage() ?? '...' }}
+          </ion-select>
+
+          <span>→ {{ remoteLanguage() ?? '...' }}</span>
 
         </div>
 
@@ -427,10 +442,17 @@
           <small>Conversation</small>
         </button>
 
+        <button class="feature-button" type="button" (click)="leaveSession()">
+
+          <span class="feature-icon">←</span>
+          <span>Leave</span>
+          <small>Join screen</small>
+        </button>
+
       </div>
 
       @if (historyOpen()) {
-      <div class="history-backdrop" (click)="toggleHistory()">
+      <div class="history-backdrop" (click)="closeHistory()">
       </div>
 
       <section class="subtitle-history">
@@ -438,8 +460,8 @@
         <div class="history-header">
           <strong>Conversation</strong>
 
-          <button type="button" (click)="toggleHistory()">
-            ×
+          <button type="button" aria-label="Close translation history" (click)="closeHistory()">
+            × Close
           </button>
         </div>
 
