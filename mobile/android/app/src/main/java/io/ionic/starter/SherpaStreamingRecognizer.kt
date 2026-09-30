@@ -200,8 +200,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                         modelConfig = modelConfig,
                         endpointConfig = endpointConfig,
                         enableEndpoint = true,
-                        decodingMethod = "greedy_search",
-                        blankPenalty = 0.5f,
+                        decodingMethod = "greedy_search",                       
                     )
 
                 Log.i(TAG, "★★★★★ CREATING OnlineRecognizer ★★★★★")
