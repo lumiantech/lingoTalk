@@ -36,10 +36,14 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
         private const val SPEECH_RMS_LOG_THRESHOLD = 0.003f
         private const val SPEECH_PEAK_LOG_THRESHOLD = 0.02f
 
-        // Controlled single-word pause/flush experiment.
-        // PCM arrives in 100 ms chunks, so 7 consecutive quiet chunks = ~700 ms.
+        // Pause detection remains based on the existing 100 ms PCM chunks:
+        // 7 consecutive quiet chunks = ~700 ms before finalization.
         private const val PAUSE_FLUSH_SILENCE_CHUNKS = 7
-        private const val TAIL_PADDING_SECONDS = 0.30f
+
+        // Match Sherpa's completed-audio padding pattern for each utterance.
+        // These are audio samples fed immediately; they are not wall-clock waits.
+        private const val LEFT_PADDING_SECONDS = 0.50f
+        private const val RIGHT_PADDING_SECONDS = 0.80f
     }
 
     private val executor = Executors.newSingleThreadExecutor()
@@ -197,6 +201,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                         endpointConfig = endpointConfig,
                         enableEndpoint = true,
                         decodingMethod = "greedy_search",
+                        blankPenalty = 0.5f,
                     )
 
                 Log.i(TAG, "★★★★★ CREATING OnlineRecognizer ★★★★★")
@@ -208,8 +213,8 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 stream =
                     recognizer!!.createStream().also {
                         Log.i(TAG, "★★★★★ SET STREAM LANGUAGE=$language ★★★★★")
-
                         it.setOption("language", language)
+                        primeStreamWithLeftPadding(it)
                     }
 
                 lastText = ""
@@ -482,12 +487,9 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                 // PAUSE-DRIVEN FLUSH
                 // ------------------------------------------------
                 //
-                // A short utterance can remain buffered with result.text == "".
-                // After ~700 ms of real PCM silence following detected speech,
-                // finish THIS stream exactly as Sherpa's completed-audio examples do:
-                // tail padding -> inputFinished -> decode until drained -> result.
-                // Then replace the finished stream with a fresh stream while keeping
-                // the already-loaded OnlineRecognizer/model alive.
+                // After ~700 ms of real PCM silence, finalize this utterance
+                // using the Sherpa completed-audio pattern:
+                // right zero padding -> inputFinished -> drain -> getResult.
                 if (utteranceHasSpeech &&
                     consecutiveSilenceChunks >= PAUSE_FLUSH_SILENCE_CHUNKS
                 ) {
@@ -497,13 +499,13 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                         TAG,
                         "★★★★★ PAUSE_FLUSH START count=$pauseFlushCount " +
                             "chunk=$pcmChunkCount silenceChunks=$consecutiveSilenceChunks " +
+                            "rightPaddingMs=${(RIGHT_PADDING_SECONDS * 1000).toInt()} " +
                             "preFlushText='$text' ★★★★★",
                     )
 
-                    val tailSamples =
-                        FloatArray((SAMPLE_RATE * TAIL_PADDING_SECONDS).toInt())
-
-                    s.acceptWaveform(tailSamples, SAMPLE_RATE)
+                    val rightPadding =
+                        FloatArray((SAMPLE_RATE * RIGHT_PADDING_SECONDS).toInt())
+                    s.acceptWaveform(rightPadding, SAMPLE_RATE)
                     s.inputFinished()
 
                     var flushDecodes = 0
@@ -540,10 +542,12 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
                     }
 
                     // inputFinished() permanently closes this stream for input.
-                    // Release it and immediately create the next utterance stream.
+                    // Release it and create the next utterance stream, primed with
+                    // Sherpa's 0.5 s left zero padding.
                     s.release()
                     stream = r.createStream().also {
                         it.setOption("language", language)
+                        primeStreamWithLeftPadding(it)
                     }
 
                     lastText = ""
@@ -593,6 +597,7 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
 
                         r.reset(s)
                         s.setOption("language", language)
+                        primeStreamWithLeftPadding(s)
                         lastText = ""
                         endpointLatched = false
                         utteranceHasSpeech = false
@@ -758,6 +763,16 @@ class SherpaStreamingRecognizer(private val context: Context, private val listen
     // ============================================================
     // PCM16 LITTLE-ENDIAN -> FLOAT [-1, 1]
     // ============================================================
+
+    private fun primeStreamWithLeftPadding(target: OnlineStream) {
+        val leftPadding = FloatArray((SAMPLE_RATE * LEFT_PADDING_SECONDS).toInt())
+        target.acceptWaveform(leftPadding, SAMPLE_RATE)
+        Log.i(
+            TAG,
+            "★★★★★ LEFT_PADDING acceptedMs=${(LEFT_PADDING_SECONDS * 1000).toInt()} " +
+                "samples=${leftPadding.size} language=$language ★★★★★",
+        )
+    }
 
     private fun pcm16LeToFloat(bytes: ByteArray): FloatArray {
 
