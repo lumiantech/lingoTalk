@@ -41,7 +41,7 @@ dependencies {
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')
-    implementation 'com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8'
+    implementation files('libs/sherpa_onnx-nemo-beam-3df7ada.aar')
     implementation 'org.apache.commons:commons-compress:1.28.0'
     implementation 'com.google.mlkit:translate:17.0.3'
     implementation 'io.github.webrtc-sdk:android:150.7871.01'
